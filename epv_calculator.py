@@ -188,7 +188,7 @@ class EPVCalculator:
         team_id: int,
         tracking_dict: Dict,
         depth: int = 0,
-        max_depth: int = 2
+        max_depth: int = 3
     ) -> float:
         """
         Calculate EPV at location (x, y) for given game state.

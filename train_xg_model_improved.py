@@ -1,5 +1,5 @@
 """
-Improved xG Model with Defender Proximity and Player Individuality
+xG Model with Defender Proximity and Player Individuality
 
 Adds critical features:
 1. Defenders in shot triangle (between shooter and goal posts)
@@ -200,7 +200,8 @@ def calculate_angle_to_goal(x: float, y: float, attacking_direction: str) -> flo
 
 def load_player_finishing_skills() -> Dict[int, float]:
     """Load player finishing skill lookup."""
-    skill_file = Path("data/player_id_to_finishing_skill.csv")
+    # Skills CSV already lives in repo root
+    skill_file = Path("player_id_to_finishing_skill.csv")
 
     if not skill_file.exists():
         print(f"⚠️  Player finishing skill file not found: {skill_file}")
@@ -395,18 +396,18 @@ def main():
     print("IMPROVED XG MODEL WITH DEFENDER PROXIMITY + INDIVIDUALITY")
     print("=" * 60)
 
-    # Set data directory
-    data_dir = Path("data/skillcorner_download")
+    # Prefer expanded dataset in more_data if present, else fallback
+    data_dir = Path("more_data") if Path("more_data").exists() else Path("skillcorner_download")
 
     if not data_dir.exists():
-        print(f"❌ Data directory not found: {data_dir}")
+        print(f"Data directory not found: {data_dir}")
         return
 
     # Extract features
     print("\n[1/5] Extracting shot features with tracking data...")
-    shots_df = extract_shot_features(data_dir, max_matches=100)  # Limit for testing
+    shots_df = extract_shot_features(data_dir, max_matches=None)  # Use all available matches
 
-    print(f"\n✅ Extracted features for {len(shots_df)} shots")
+    print(f"\nExtracted features for {len(shots_df)} shots")
     print(f"   Goals scored: {shots_df['goal'].sum()} ({shots_df['goal'].mean():.1%})")
 
     # Check for missing values
