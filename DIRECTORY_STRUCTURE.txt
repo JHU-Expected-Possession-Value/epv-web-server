@@ -1,0 +1,55 @@
+EPV_SARG/
+│
+├── README.md                          # Main project documentation
+├── requirements.txt                   # Python dependencies
+├── .gitignore                         # Git ignore rules
+│
+├── src/                              # Core source code modules
+│   ├── epv_calculator.py             # Main EPV calculation engine
+│   ├── pitch_control.py              # Pitch control computation
+│   ├── xg_model.py                   # Expected goals model
+│   ├── passing_model.py              # Pass completion model
+│   └── dribbling_model.py            # Dribble success model
+│
+├── scripts/                          # Executable scripts
+│   ├── generate_results.py           # Generate various visualizations
+│   ├── generate_epv_heatmap.py       # Generate EPV heatmap
+│   └── generate_epv_heatmap_from_data.py  # Heatmap with external data
+│
+├── training/                         # Model training scripts
+│   ├── train_xg_model_improved.py    # Train xG model
+│   ├── train_passing_model_improved.py  # Train passing model
+│   └── train_dribbling_model.py      # Train dribbling model
+│
+├── models/                           # Trained ML models (*.pkl)
+│   ├── xg_model_improved.pkl         # Trained xG model (5.7 MB)
+│   ├── passing_model_improved.pkl    # Trained passing model (9.8 MB)
+│   ├── dribbling_model_proper_split.pkl  # Trained dribbling model (4.6 MB)
+│   └── train_val_test_split.pkl      # Train/val/test split indices
+│
+├── data/                             # Player skill data (*.csv)
+│   ├── player_id_to_finishing_skill.csv  # Player shooting abilities
+│   ├── player_id_to_passing_skill.csv    # Player passing abilities
+│   ├── player_id_to_skill.csv            # Player dribbling abilities
+│   └── mls_2023_player_possession_FIXED_NAMES.csv  # Player names
+│
+├── results/                          # Generated visualizations (*.png)
+│   ├── epv_heatmap_simple.png        # EPV heatmap visualization
+│   ├── scenario_compare.png          # Scenario comparisons
+│   ├── attack_timeseries.png         # Attack evolution over time
+│   ├── shot_with_tracking.png        # Real shot with tracking data
+│   └── ... (10+ additional visualizations)
+│
+└── docs/                             # Additional documentation
+    ├── QUICKSTART.md                 # Quick start guide
+    ├── DATA_README.md                # Data requirements and structure
+    └── SUBMISSION_CHECKLIST.md       # Submission preparation checklist
+
+Total:
+- 6 core Python modules (src/)
+- 3 executable scripts (scripts/)
+- 3 training scripts (training/)
+- 4 trained models (models/)
+- 4 data files (data/)
+- 14 visualization outputs (results/)
+- 4 documentation files (docs/ + README.md)
