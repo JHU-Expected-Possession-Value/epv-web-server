@@ -27,8 +27,7 @@ EPV_SARG/
 │   └── dribbling_model.py         # Dribble success model
 │
 ├── scripts/                       # Executable scripts
-│   ├── download_skillcorner_data.py  # Data download script
-│   └── generate_results.py        # Visualization generation
+│   └── download_skillcorner_data.py  # Data download script
 │
 ├── training/                      # Model training scripts
 │   ├── train_xg_model_improved.py
@@ -59,6 +58,49 @@ EPV_SARG/
 # Install dependencies
 pip install -r requirements.txt
 ```
+
+### Using the EPV Calculator
+
+```python
+import sys
+from pathlib import Path
+sys.path.insert(0, 'src')
+
+from epv_calculator import EPVCalculator
+
+# Initialize the calculator with trained models
+calc = EPVCalculator(
+    xg_model_path=Path('models/xg_model_improved.pkl'),
+    passing_model_path=Path('models/passing_model_improved.pkl'),
+    dribbling_model_path=Path('models/dribbling_model_proper_split.pkl'),
+    xg_skills_path=Path('data/player_id_to_finishing_skill.csv'),
+    passing_skills_path=Path('data/player_id_to_passing_skill.csv'),
+    dribbling_skills_path=Path('data/player_id_to_skill.csv')
+)
+
+# Calculate EPV at a specific position
+# Requires match context (tracking data, frame info)
+# See src/epv_calculator.py for full documentation
+
+# Example: Evaluate shooting action
+xg = calc.evaluate_shoot(
+    x=40.0,              # Position x-coordinate (goal at x=52.5)
+    y=0.0,               # Position y-coordinate
+    frame=1000,          # Frame number
+    frame_data={},       # Tracking frame data
+    player_id=12345,     # Player ID
+    team_id=1            # Team ID
+)
+print(f"xG from this position: {xg:.4f}")
+```
+
+### View Results
+
+Pre-generated EPV visualizations are available in the `results/` directory, showing:
+- EPV heatmaps across the pitch
+- Attacking scenario comparisons
+- Time-series EPV evolution during attacks
+- Player individualization examples
 
 ## Data
 
