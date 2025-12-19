@@ -45,9 +45,12 @@ EPV_SARG/
 │   └── player_id_to_skill.csv
 │
 └── results/                       # Example visualizations
-    ├── epv_heatmap_simple.png
-    ├── scenario_compare.png
-    └── attack_timeseries.png
+    ├── scenario1_edge_box_clear_arrows.png
+    ├── scenario2_wide_position_clear_arrows.png
+    ├── individuality1_shooting_penalty_FINAL.png
+    ├── individuality2_edge_of_box_FINAL.png
+    ├── shot_with_tracking.png
+    └── shot_with_tracking_alt.png
 ```
 
 ## Quick Start
@@ -60,6 +63,13 @@ pip install -r requirements.txt
 ```
 
 ### Using the EPV Calculator
+
+The EPV calculator evaluates the expected goals from any position by considering three possible actions:
+- **Shoot**: Immediate shot probability (xG)
+- **Pass**: Best pass to a teammate, then their EPV
+- **Dribble**: Dribble to a better position, then EPV from there
+
+**Example usage:**
 
 ```python
 import sys
@@ -78,29 +88,38 @@ calc = EPVCalculator(
     dribbling_skills_path=Path('data/player_id_to_skill.csv')
 )
 
-# Calculate EPV at a specific position
-# Requires match context (tracking data, frame info)
-# See src/epv_calculator.py for full documentation
-
-# Example: Evaluate shooting action
-xg = calc.evaluate_shoot(
-    x=40.0,              # Position x-coordinate (goal at x=52.5)
-    y=0.0,               # Position y-coordinate
-    frame=1000,          # Frame number
-    frame_data={},       # Tracking frame data
-    player_id=12345,     # Player ID
-    team_id=1            # Team ID
+# Set match context (required for full EPV calculation)
+# This loads tracking data and team rosters for a specific match
+calc.set_match_context(
+    match_json_path=Path('skillcorner_download/match_123.json'),
+    tracking_path=Path('skillcorner_download/123_tracking_extrapolated.jsonl'),
+    events_df=events_dataframe  # Loaded from CSV
 )
-print(f"xG from this position: {xg:.4f}")
+
+# Get EPV for a possession (returns max of shoot/pass/dribble)
+epv = calc.get_epv(
+    x=40.0,              # Position x-coordinate (center field at x=52.5)
+    y=0.0,               # Position y-coordinate (center width at y=0)
+    frame=1000,          # Frame number from tracking data
+    player_id=12345,     # Player with possession
+    team_id=1,           # Attacking team ID
+    tracking_dict=tracking_dict  # Frame-by-frame tracking data
+)
+print(f"EPV (best action value): {epv:.4f}")
+
+# Or evaluate specific actions individually:
+shoot_value = calc.evaluate_shoot(x, y, frame, frame_data, player_id, team_id)
+pass_value = calc.evaluate_best_pass(x, y, frame, frame_data, player_id, team_id, tracking_dict, depth=2)
 ```
+
+**Note:** Full EPV calculation requires tracking data. See the training scripts in `training/` for examples of how to load and use match data.
 
 ### View Results
 
-Pre-generated EPV visualizations are available in the `results/` directory, showing:
-- EPV heatmaps across the pitch
-- Attacking scenario comparisons
-- Time-series EPV evolution during attacks
-- Player individualization examples
+Pre-generated EPV visualizations are available in the `results/` directory, demonstrating:
+- **Scenario analysis**: Decision-making at edge of box and wide positions with clear action arrows
+- **Player individualization**: How different player skills affect EPV calculations (penalty area, edge of box)
+- **Real match tracking**: EPV calculations with actual player positions from tracking data
 
 ## Data
 
