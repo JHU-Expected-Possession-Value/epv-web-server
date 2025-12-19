@@ -4,3 +4,4 @@ scikit-learn>=1.0.0
 matplotlib>=3.4.0
 joblib>=1.0.0
 scipy>=1.7.0
+requests>=2.26.0
