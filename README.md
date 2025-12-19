@@ -1,4 +1,4 @@
-# EPV-SARG: Expected Possession Value with Spatial Action Rating Generator
+# EPV-SARG: Expected Possession Value with Player Individuality
 
 In soccer, understanding the value of possession at any moment is crucial for tactical decision-making. This project develops an Expected Possession Value (EPV) system that quantifies the goal-scoring probability from any position on the field by evaluating what players can do: shoot, pass, or dribble. By combining machine learning models trained on real tracking data with recursive action evaluation, our EPV provides a comprehensive framework for assessing attacking potential and informing strategic decisions. This work extends traditional EPV by incorporating individual player skill into the model when choosing the best decision.
 
