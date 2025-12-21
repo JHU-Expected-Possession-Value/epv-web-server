@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from pitch_control import PitchControlRunner, load_match_meta_robust, load_tracking_jsonl
 from dribbling_model import DribblingModel
+from xg_model import DampedXGModel
 
 
 class EPVCalculator:
@@ -72,6 +73,14 @@ class EPVCalculator:
             else:
                 self.xg_model = xg_obj
                 self.xg_feature_cols = None
+        if isinstance(self.xg_model, DampedXGModel):
+            print(
+                f"  ✓ xG dampening enabled "
+                f"(distance>{self.xg_model.distance_threshold:.1f}m, "
+                f"angle<{self.xg_model.angle_threshold:.1f}°)"
+            )
+        else:
+            print("  ⚠️  xG dampening not enabled (raw model)")
 
         print("  Loading passing model...")
         with open(passing_model_path, 'rb') as f:
@@ -110,6 +119,7 @@ class EPVCalculator:
         self.pc_runner: Optional[PitchControlRunner] = None
         self.current_frame_data = None
         self.current_team_roster = None
+        self.match_meta = None
 
         # Cache for EPV values (reset per frame)
         self.cache = {}
@@ -151,6 +161,7 @@ class EPVCalculator:
         # Load pitch control runner
         meta = load_match_meta_robust(match_json_path)
         frames = load_tracking_jsonl(tracking_path)
+        self.match_meta = meta
         self.pc_runner = PitchControlRunner(meta, frames)
 
         # Build team roster
@@ -174,6 +185,51 @@ class EPVCalculator:
             team_roster[team_id].add(player_id)
 
         return team_roster
+
+    def _opposite_side(self, side: str) -> str:
+        if "left_to_right" in side:
+            return "right_to_left"
+        if "right_to_left" in side:
+            return "left_to_right"
+        return side
+
+    def _side_to_goal_x(self, side: str) -> float:
+        if "right_to_left" in side:
+            return -self.pitch_length / 2
+        if "left_to_right" in side:
+            return self.pitch_length / 2
+        return self.goal_x
+
+    def _resolve_goal_x(self, team_id: int, frame_data: Dict) -> float:
+        if not self.match_meta:
+            return self.goal_x
+
+        period = frame_data.get("period")
+        try:
+            period = int(period)
+        except Exception:
+            period = 1
+
+        home_sides = self.match_meta.get("home_sides") or []
+        if home_sides:
+            home_side = home_sides[period - 1] if period - 1 < len(home_sides) else home_sides[0]
+        else:
+            home_side = "left_to_right"
+
+        home_id = self.match_meta.get("home_id")
+        away_id = self.match_meta.get("away_id")
+
+        side = home_side
+        if home_id is not None and team_id is not None:
+            try:
+                if int(team_id) == int(home_id):
+                    side = home_side
+                elif away_id is not None and int(team_id) == int(away_id):
+                    side = self._opposite_side(home_side)
+            except Exception:
+                side = home_side
+
+        return self._side_to_goal_x(side)
 
     def reset_cache(self):
         """Reset cache (call when frame changes)."""
@@ -246,13 +302,19 @@ class EPVCalculator:
         Returns:
             Expected goals from shooting at this location
         """
+        goal_x = self._resolve_goal_x(team_id, frame_data)
+
         # Calculate shooting features
-        distance_to_goal = np.sqrt((x - self.goal_x)**2 + (y - self.goal_y)**2)
-        angle_to_goal = np.degrees(np.arctan2(abs(y - self.goal_y), abs(x - self.goal_x)))
+        distance_to_goal = np.sqrt((x - goal_x)**2 + (y - self.goal_y)**2)
+        ang1 = np.degrees(np.arctan2(3.66 - y, goal_x - x))
+        ang2 = np.degrees(np.arctan2(-3.66 - y, goal_x - x))
+        angle_to_goal = abs(ang2 - ang1)
+        if angle_to_goal > 180:
+            angle_to_goal = 360 - angle_to_goal
 
         # Count defenders in shot triangle
         defenders_in_triangle = self._count_defenders_in_triangle(
-            x, y, frame_data, team_id
+            x, y, frame_data, team_id, goal_x=goal_x
         )
 
         # Count defenders within 3m
@@ -263,12 +325,20 @@ class EPVCalculator:
         # Get player finishing skill
         player_finishing_skill = self.finishing_skills.get(player_id, 0.0)
 
+        # Pitch control at shot location
+        pitch_control = 0.5
+        if self.pc_runner and frame > 0:
+            try:
+                pitch_control = float(self.pc_runner.pc_at_point(frame, x, y))
+            except Exception:
+                pitch_control = 0.5
+
         # Other features (simplified - you can add more)
         speed_avg = 5.0  # Default
-        inside_defensive_shape = int(x < 0)  # Simple heuristic
-        last_defensive_line_x = -10.0  # Default
+        inside_defensive_shape = int(x * goal_x < 0)  # Own half relative to goal
+        last_defensive_line_x = -10.0 if goal_x > 0 else 10.0  # Default
         last_defensive_line_height = 20.0  # Default
-        penalty_area = int(abs(x - self.goal_x) < 16.5 and abs(y) < 20.15)
+        penalty_area = int(abs(x - goal_x) < 16.5 and abs(y) < 20.15)
         distance_covered = 0.0  # Static shot
         trajectory_angle = 0.0  # Straight
 
@@ -279,6 +349,7 @@ class EPVCalculator:
             'defenders_in_triangle': defenders_in_triangle,
             'defenders_within_3m': defenders_within_3m,
             'player_finishing_skill': player_finishing_skill,
+            'pitch_control': pitch_control,
             'speed_avg': speed_avg,
             'penalty_area': penalty_area,
             'inside_defensive_shape': inside_defensive_shape,
@@ -311,20 +382,24 @@ class EPVCalculator:
         player_id: int,
         team_id: int,
         tracking_dict: Dict,
-        depth: int
-    ) -> float:
+        depth: int,
+        return_dest: bool = False
+    ):
         """
         Evaluate best pass action.
 
-        Samples several pass destinations and returns highest Q-value.
+        Iterates over all detected teammate positions and returns highest Q-value.
 
         Returns:
             Expected goals from best pass
         """
         best_q = 0.0
+        best_dest = None
 
-        # Sample pass destinations using ACTUAL teammate positions
-        destinations = self._sample_pass_destinations(x, y, frame_data, team_id, player_id)
+        # Evaluate all actual teammate positions
+        destinations = self._get_teammate_positions(frame_data, team_id, player_id)
+        if not destinations:
+            return (best_q, best_dest) if return_dest else best_q
 
         for dest_x, dest_y in destinations:
             # Check if destination is valid
@@ -337,9 +412,11 @@ class EPVCalculator:
                 tracking_dict, depth
             )
 
-            best_q = max(best_q, q)
+            if q > best_q:
+                best_q = q
+                best_dest = (dest_x, dest_y)
 
-        return best_q
+        return (best_q, best_dest) if return_dest else best_q
 
     def evaluate_single_pass(
         self,
@@ -633,7 +710,8 @@ class EPVCalculator:
         x: float,
         y: float,
         frame_data: Dict,
-        team_id: int
+        team_id: int,
+        goal_x: Optional[float] = None
     ) -> int:
         """Count defenders in shot triangle (between shooter and goal)."""
         if not frame_data or 'player_data' not in frame_data:
@@ -650,6 +728,8 @@ class EPVCalculator:
         opponent_players = set()
         for opp_team_id in opponent_team_ids:
             opponent_players.update(self.current_team_roster[opp_team_id])
+
+        gx = self.goal_x if goal_x is None else goal_x
 
         # Goal posts
         goal_left_y = -3.66
@@ -669,7 +749,7 @@ class EPVCalculator:
 
             # Check if in triangle (simplified)
             # Between shooter and goal (x-wise)
-            if not (min(x, self.goal_x) <= px <= max(x, self.goal_x)):
+            if not (min(x, gx) <= px <= max(x, gx)):
                 continue
 
             # Between goal posts (y-wise, with margin)
@@ -804,19 +884,23 @@ class EPVCalculator:
         Returns:
             Probability of dribble success (0-1)
         """
+        goal_x = self._resolve_goal_x(team_id, frame_data)
+
         # Calculate basic features
         distance_covered = np.sqrt((x_end - x_start)**2 + (y_end - y_start)**2)
         duration = distance_covered / 5.0  # Assume ~5 m/s dribble speed
         speed = distance_covered / duration if duration > 0 else 0.0
 
-        dist_to_goal_start = np.sqrt((x_start - self.goal_x)**2 + (y_start - self.goal_y)**2)
-        dist_to_goal_end = np.sqrt((x_end - self.goal_x)**2 + (y_end - self.goal_y)**2)
+        dist_to_goal_start = np.sqrt((x_start - goal_x)**2 + (y_start - self.goal_y)**2)
+        dist_to_goal_end = np.sqrt((x_end - goal_x)**2 + (y_end - self.goal_y)**2)
         dist_to_goal_change = dist_to_goal_end - dist_to_goal_start
 
         # Angle change
-        angle_start = np.degrees(np.arctan2(y_start, x_start - self.goal_x))
-        angle_end = np.degrees(np.arctan2(y_end, x_end - self.goal_x))
+        angle_start = np.degrees(np.arctan2(y_start, x_start - goal_x))
+        angle_end = np.degrees(np.arctan2(y_end, x_end - goal_x))
         angle_change = abs(angle_end - angle_start)
+        if angle_change > 180:
+            angle_change = 360 - angle_change
 
         # Distance from sideline
         dist_from_sideline = min(abs(y_start - self.pitch_width/2), abs(y_start + self.pitch_width/2))

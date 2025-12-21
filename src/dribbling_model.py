@@ -375,10 +375,14 @@ class DribblingModel:
             speed = distance_covered / duration if duration > 0 else 0.0
 
             # Pitch control (CRITICAL FEATURE)
-            # You should pass in pitch control values from your implementation
-            if pitch_control:
+            pc_start = event.get('pitch_control_start')
+            pc_end = event.get('pitch_control_end')
+            if pd.notna(pc_start) and pd.notna(pc_end):
+                pc_start = float(pc_start)
+                pc_end = float(pc_end)
+                pc_change = pc_end - pc_start
+            elif pitch_control:
                 # Assuming pitch_control is a dict with frame keys
-                # You'll need to adapt this to your actual pitch control implementation
                 pc_start = pitch_control.get(frame_start, 0.5)
                 pc_end = pitch_control.get(frame_end, 0.5)
                 pc_change = pc_end - pc_start
