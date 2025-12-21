@@ -5,7 +5,7 @@ In soccer, understanding the value of possession at any moment is crucial for ta
 ## Overview
 
 This project implements an EPV calculation system that evaluates the expected goals from any position on the field by recursively computing action values for:
-- **Shooting**: Using an xG (expected goals) model
+- **Shooting**: Using an xG (expected goals) model (with distance/angle dampening for low-quality shots)
 - **Passing**: Using a pass completion model
 - **Dribbling**: Using a dribble success model
 
@@ -28,6 +28,7 @@ EPV_SARG/
 │
 ├── scripts/                       # Executable scripts
 │   └── download_skillcorner_data.py  # Data download script
+│   └── plot_epv.py                 # Plot EPV snapshot for a match/time
 │
 ├── training/                      # Model training scripts
 │   ├── train_xg_model_improved.py
@@ -120,6 +121,21 @@ Pre-generated EPV visualizations are available in the `results/` directory, demo
 - **Scenario analysis**: Decision-making at edge of box and wide positions with clear action arrows
 - **Player individualization**: How different player skills affect EPV calculations (penalty area, edge of box)
 - **Real match tracking**: EPV calculations with actual player positions from tracking data
+
+You can generate a one-off EPV snapshot plot for a match/time with:
+
+```bash
+python3 scripts/plot_epv.py --match-id 1039803 --time 12:34
+```
+
+Example plots (match_id / event_id):
+
+```bash
+python3 scripts/plot_epv.py --match-id 1065730 --time 39:06.0  # event_id 8_445
+python3 scripts/plot_epv.py --match-id 1059850 --time 21:51.7  # event_id 8_217
+python3 scripts/plot_epv.py --match-id 1066460 --time 38:36.8  # event_id 8_492
+python3 scripts/plot_epv.py --match-id 1039807 --time 52:28.5  # event_id 8_498
+```
 
 ## Data
 
@@ -234,4 +250,3 @@ All models are trained using scikit-learn on MLS 2023 SkillCorner data.
 
 - Fernández, J., & Bornn, L. (2018). Wide Open Spaces: A statistical technique for measuring space creation in professional soccer. *MIT Sloan Sports Analytics Conference*.
 - Spearman, W. (2018). Beyond Expected Goals. *MIT Sloan Sports Analytics Conference*.
-
