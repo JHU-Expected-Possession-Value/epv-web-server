@@ -26,8 +26,9 @@ from typing import Dict, List, Tuple, Optional
 import glob
 import sys
 
-# Add src to path for pitch_control import
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+# Add repo src to path for pitch_control import
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 
 try:
     from pitch_control import (
@@ -43,6 +44,14 @@ except ImportError:
     PITCH_CONTROL_AVAILABLE = False
     PitchControlRunner = None
     PitchControlCache = None
+
+from passing_model import (
+    DefenderPriorityPassModel,
+    PASS_DEFENDER_LANE_WEIGHT,
+    PASS_DEFENDER_DEST_WEIGHT,
+    PASS_MIN_DIST_CAP,
+    PASS_MIN_DIST_FLOOR,
+)
 
 
 def load_tracking_data(tracking_path: Path) -> Dict:
@@ -188,6 +197,61 @@ def calculate_defenders_in_passing_lane(
     return defender_count
 
 
+def calculate_min_defender_dist_to_passing_lane(
+    x_origin: float,
+    y_origin: float,
+    x_dest: float,
+    y_dest: float,
+    frame_data: dict,
+    passer_team_id: int,
+    team_roster: dict,
+    default_distance: float = 50.0
+) -> float:
+    """Compute minimum perpendicular distance of any defender to the pass lane segment."""
+    if not frame_data or 'player_data' not in frame_data:
+        return default_distance
+
+    opponent_team_ids = [tid for tid in team_roster.keys() if tid != passer_team_id]
+    if not opponent_team_ids:
+        return default_distance
+
+    opponent_players = set()
+    for opp_team_id in opponent_team_ids:
+        opponent_players.update(team_roster[opp_team_id])
+
+    pass_dx = x_dest - x_origin
+    pass_dy = y_dest - y_origin
+    pass_length = np.sqrt(pass_dx**2 + pass_dy**2)
+    if pass_length < 0.1:
+        return default_distance
+
+    min_dist = None
+
+    for player in frame_data.get('player_data', []):
+        if not player.get('is_detected', False):
+            continue
+
+        player_id = player['player_id']
+        if player_id not in opponent_players:
+            continue
+
+        px = player['x']
+        py = player['y']
+
+        to_player_x = px - x_origin
+        to_player_y = py - y_origin
+
+        projection = (to_player_x * pass_dx + to_player_y * pass_dy) / pass_length
+        if projection < 0 or projection > pass_length:
+            continue
+
+        perp_dist = abs(to_player_x * pass_dy - to_player_y * pass_dx) / pass_length
+        if min_dist is None or perp_dist < min_dist:
+            min_dist = perp_dist
+
+    return float(min_dist) if min_dist is not None else default_distance
+
+
 def calculate_pitch_control(
     x: float,
     y: float,
@@ -209,6 +273,40 @@ def calculate_pitch_control(
     except Exception as e:
         # If calculation fails, return neutral value
         return 0.5
+
+
+def calculate_pitch_control_path_min(
+    x_origin: float,
+    y_origin: float,
+    x_dest: float,
+    y_dest: float,
+    frame_idx: int,
+    pc_runner: Optional['PitchControlRunner'] = None,
+    n_samples: int = 5
+) -> float:
+    """Compute minimum pitch control along the pass line segment."""
+    if not PITCH_CONTROL_AVAILABLE or pc_runner is None:
+        return 0.5
+
+    if frame_idx is None or (isinstance(frame_idx, float) and np.isnan(frame_idx)):
+        return 0.5
+
+    pass_dx = x_dest - x_origin
+    pass_dy = y_dest - y_origin
+    pass_length = np.sqrt(pass_dx**2 + pass_dy**2)
+    if pass_length < 0.5:
+        pc_origin = calculate_pitch_control(x_origin, y_origin, frame_idx, pc_runner)
+        pc_dest = calculate_pitch_control(x_dest, y_dest, frame_idx, pc_runner)
+        return float(min(pc_origin, pc_dest))
+
+    fractions = np.linspace(0.2, 0.8, n_samples)
+    values = []
+    for frac in fractions:
+        x = x_origin + frac * pass_dx
+        y = y_origin + frac * pass_dy
+        values.append(calculate_pitch_control(x, y, frame_idx, pc_runner))
+
+    return float(np.min(values)) if values else 0.5
 
 
 def load_player_passing_skills() -> Dict[int, float]:
@@ -242,7 +340,10 @@ def extract_pass_features(data_dir: Path, max_matches: int = None) -> pd.DataFra
     player_skills = load_player_passing_skills()
 
     # Find all dynamic event files
-    event_files = list(data_dir.glob("*_dynamic_events.csv"))
+    event_files = sorted(
+        f for f in data_dir.glob("*_dynamic_events.csv")
+        if not f.name.startswith("._")
+    )
 
     if max_matches:
         event_files = event_files[:max_matches]
@@ -361,6 +462,11 @@ def extract_pass_features(data_dir: Path, max_matches: int = None) -> pd.DataFra
                 frame_data, team_id, team_roster, lane_width=2.0
             )
 
+            min_defender_dist_to_lane = calculate_min_defender_dist_to_passing_lane(
+                x_origin, y_origin, x_dest, y_dest,
+                frame_data, team_id, team_roster
+            )
+
             # Calculate pitch control using actual runner
             pc_origin = calculate_pitch_control(
                 x_origin, y_origin, frame_start, pc_runner
@@ -368,6 +474,10 @@ def extract_pass_features(data_dir: Path, max_matches: int = None) -> pd.DataFra
 
             pc_dest = calculate_pitch_control(
                 x_dest, y_dest, frame_start, pc_runner
+            )
+
+            pc_path_min = calculate_pitch_control_path_min(
+                x_origin, y_origin, x_dest, y_dest, frame_start, pc_runner
             )
 
             # Get player passing skill
@@ -397,8 +507,10 @@ def extract_pass_features(data_dir: Path, max_matches: int = None) -> pd.DataFra
                 'defenders_near_origin': defenders_near_origin,
                 'defenders_near_dest': defenders_near_dest,
                 'defenders_in_lane': defenders_in_lane,
+                'min_defender_dist_to_lane': min_defender_dist_to_lane,
                 'pitch_control_origin': pc_origin,
                 'pitch_control_dest': pc_dest,
+                'pitch_control_path_min': pc_path_min,
                 'player_passing_skill': player_passing_skill,
                 'speed_avg': speed_avg if pd.notna(speed_avg) else 0.0,
                 'inside_defensive_shape': int(inside_defensive_shape) if pd.notna(inside_defensive_shape) else 0,
@@ -437,7 +549,7 @@ def main():
     print("=" * 60)
 
     # Set data directory
-    data_dir = Path("data/skillcorner_download")
+    data_dir = Path("more_data") if Path("more_data").exists() else Path("skillcorner_download")
 
     if not data_dir.exists():
         print(f"❌ Data directory not found: {data_dir}")
@@ -445,7 +557,7 @@ def main():
 
     # Extract features
     print("\n[1/5] Extracting pass features with tracking data...")
-    passes_df = extract_pass_features(data_dir, max_matches=100)  # Limit for testing
+    passes_df = extract_pass_features(data_dir, max_matches=150)
 
     print(f"\n✅ Extracted features for {len(passes_df)} passes")
     print(f"   Completed: {passes_df['pass_completed'].sum()} ({passes_df['pass_completed'].mean():.1%})")
@@ -455,16 +567,17 @@ def main():
     print(f"     defenders_near_origin: mean={passes_df['defenders_near_origin'].mean():.2f}, max={passes_df['defenders_near_origin'].max()}")
     print(f"     defenders_near_dest: mean={passes_df['defenders_near_dest'].mean():.2f}, max={passes_df['defenders_near_dest'].max()}")
     print(f"     defenders_in_lane: mean={passes_df['defenders_in_lane'].mean():.2f}, max={passes_df['defenders_in_lane'].max()}")
+    print(f"     min_defender_dist_to_lane: mean={passes_df['min_defender_dist_to_lane'].mean():.2f}, max={passes_df['min_defender_dist_to_lane'].max():.2f}")
     print(f"     player_passing_skill: mean={passes_df['player_passing_skill'].mean():.2f}, max={passes_df['player_passing_skill'].max():.2f}")
 
     # Prepare features
     feature_cols = [
         'pass_distance', 'pass_angle', 'forward_progress',
         'defenders_near_origin', 'defenders_near_dest', 'defenders_in_lane',
-        'pitch_control_origin', 'pitch_control_dest',
+        'min_defender_dist_to_lane',
+        'pitch_control_origin', 'pitch_control_dest', 'pitch_control_path_min',
         'player_passing_skill',
-        'speed_avg', 'inside_defensive_shape',
-        'last_defensive_line_x', 'last_defensive_line_height'
+        'speed_avg', 'inside_defensive_shape'
     ]
 
     X = passes_df[feature_cols].fillna(0).values
@@ -501,6 +614,15 @@ def main():
 
     model.fit(X_train, y_train)
 
+    priority_model = DefenderPriorityPassModel(
+        model,
+        feature_cols,
+        lane_weight=PASS_DEFENDER_LANE_WEIGHT,
+        dest_weight=PASS_DEFENDER_DEST_WEIGHT,
+        min_dist_cap=PASS_MIN_DIST_CAP,
+        min_dist_floor=PASS_MIN_DIST_FLOOR
+    )
+
     # Feature importances
     print("\n   Feature importances:")
     importances = sorted(
@@ -514,8 +636,8 @@ def main():
     # Evaluate
     print("\n[4/5] Evaluating model...")
 
-    y_train_pred = model.predict(X_train)
-    y_train_proba = model.predict_proba(X_train)[:, 1]
+    y_train_proba = priority_model.predict_proba(X_train)[:, 1]
+    y_train_pred = (y_train_proba >= 0.5).astype(int)
 
     print("\n   TRAINING SET:")
     print(f"     Accuracy:     {accuracy_score(y_train, y_train_pred):.4f}")
@@ -524,8 +646,8 @@ def main():
     train_ece = calculate_calibration_error(y_train, y_train_proba)
     print(f"     ECE:          {train_ece:.4f}")
 
-    y_test_pred = model.predict(X_test)
-    y_test_proba = model.predict_proba(X_test)[:, 1]
+    y_test_proba = priority_model.predict_proba(X_test)[:, 1]
+    y_test_pred = (y_test_proba >= 0.5).astype(int)
 
     print("\n   TEST SET:")
     print(f"     Accuracy:     {accuracy_score(y_test, y_test_pred):.4f}")
@@ -552,11 +674,17 @@ def main():
 
     with open(model_file, 'wb') as f:
         pickle.dump({
-            'model': model,
+            'model': priority_model,
             'feature_cols': feature_cols,
             'test_accuracy': accuracy_score(y_test, y_test_pred),
             'test_auc': roc_auc_score(y_test, y_test_proba),
-            'test_ece': test_ece
+            'test_ece': test_ece,
+            'defender_priority': {
+                'lane_weight': PASS_DEFENDER_LANE_WEIGHT,
+                'dest_weight': PASS_DEFENDER_DEST_WEIGHT,
+                'min_dist_cap': PASS_MIN_DIST_CAP,
+                'min_dist_floor': PASS_MIN_DIST_FLOOR
+            }
         }, f)
 
     print(f"   ✅ Model saved to {model_file}")
@@ -568,7 +696,10 @@ def main():
     print(f"  ✅ Added defenders_near_origin feature")
     print(f"  ✅ Added defenders_near_dest feature")
     print(f"  ✅ Added defenders_in_lane feature")
+    print(f"  ✅ Added min_defender_dist_to_lane feature")
     print(f"  ✅ Added pitch_control features (placeholder)")
+    print(f"  ✅ Added pitch_control_path_min feature")
+    print(f"  ✅ Added defender-priority pass penalty")
     print(f"  ✅ Added player_passing_skill (individuality)")
     print(f"  ✅ Match-grouped split (no leakage)")
     print(f"\nTest performance:")

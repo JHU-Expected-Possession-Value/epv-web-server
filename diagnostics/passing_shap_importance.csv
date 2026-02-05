@@ -1,0 +1,16 @@
+feature,mean_abs_shap
+pass_distance,0.024661590998204766
+last_defensive_line_x,0.02139857970153345
+last_defensive_line_height,0.020160929740702674
+player_passing_skill,0.019667449131712065
+forward_progress,0.0162093384924304
+speed_avg,0.014395114670265538
+pass_angle,0.013050995789113215
+pitch_control_origin,0.005197327908770608
+pitch_control_dest,0.004140770043059641
+pitch_control_path_min,0.003888876319282937
+defenders_near_origin,0.002518030321935996
+inside_defensive_shape,0.0016357017847306843
+min_defender_dist_to_lane,0.001227704939578906
+defenders_near_dest,0.0011478443141802546
+defenders_in_lane,5.0930006100378004e-05

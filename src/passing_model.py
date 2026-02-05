@@ -33,6 +33,100 @@ except ImportError:
         PITCH_CONTROL_AVAILABLE = False
         print("⚠️  Pitch control module not available")
 
+PASS_DEFENDER_LANE_WEIGHT = 0.4
+PASS_DEFENDER_DEST_WEIGHT = 0.25
+PASS_MIN_DIST_CAP = 6.0
+PASS_MIN_DIST_FLOOR = 0.2
+
+
+def apply_defender_priority_penalty(
+    prob,
+    defenders_in_lane,
+    defenders_near_dest,
+    min_defender_dist_to_lane,
+    lane_weight=PASS_DEFENDER_LANE_WEIGHT,
+    dest_weight=PASS_DEFENDER_DEST_WEIGHT,
+    min_dist_cap=PASS_MIN_DIST_CAP,
+    min_dist_floor=PASS_MIN_DIST_FLOOR
+):
+    """Apply a defender-priority penalty to pass success probability."""
+    is_scalar = np.isscalar(prob)
+    prob_arr = np.asarray(prob, dtype=float)
+    lane_arr = np.nan_to_num(np.asarray(defenders_in_lane, dtype=float), nan=0.0)
+    dest_arr = np.nan_to_num(np.asarray(defenders_near_dest, dtype=float), nan=0.0)
+    dist_arr = np.nan_to_num(np.asarray(min_defender_dist_to_lane, dtype=float), nan=min_dist_cap)
+
+    lane_factor = np.exp(-lane_weight * np.clip(lane_arr, 0.0, None))
+    dest_factor = np.exp(-dest_weight * np.clip(dest_arr, 0.0, None))
+    dist_factor = np.clip(dist_arr / float(min_dist_cap), min_dist_floor, 1.0)
+
+    penalty = lane_factor * dest_factor * dist_factor
+    adjusted = np.clip(prob_arr * penalty, 0.0, 1.0)
+
+    return float(adjusted) if is_scalar else adjusted
+
+
+class DefenderPriorityPassModel:
+    """Wrap a pass model to emphasize defender proximity features."""
+
+    def __init__(
+        self,
+        model,
+        feature_cols,
+        lane_weight=PASS_DEFENDER_LANE_WEIGHT,
+        dest_weight=PASS_DEFENDER_DEST_WEIGHT,
+        min_dist_cap=PASS_MIN_DIST_CAP,
+        min_dist_floor=PASS_MIN_DIST_FLOOR
+    ):
+        self.model = model
+        self.feature_cols = list(feature_cols) if feature_cols is not None else None
+        self.lane_weight = float(lane_weight)
+        self.dest_weight = float(dest_weight)
+        self.min_dist_cap = float(min_dist_cap)
+        self.min_dist_floor = float(min_dist_floor)
+
+        self._lane_idx = None
+        self._dest_idx = None
+        self._min_dist_idx = None
+        if self.feature_cols:
+            if "defenders_in_lane" in self.feature_cols:
+                self._lane_idx = self.feature_cols.index("defenders_in_lane")
+            if "defenders_near_dest" in self.feature_cols:
+                self._dest_idx = self.feature_cols.index("defenders_near_dest")
+            if "min_defender_dist_to_lane" in self.feature_cols:
+                self._min_dist_idx = self.feature_cols.index("min_defender_dist_to_lane")
+
+    def predict_proba(self, X):
+        proba = np.asarray(self.model.predict_proba(X))
+        if self._lane_idx is None or self._dest_idx is None or self._min_dist_idx is None:
+            return proba
+
+        X_arr = np.asarray(X)
+        adjusted = apply_defender_priority_penalty(
+            proba[:, 1],
+            X_arr[:, self._lane_idx],
+            X_arr[:, self._dest_idx],
+            X_arr[:, self._min_dist_idx],
+            lane_weight=self.lane_weight,
+            dest_weight=self.dest_weight,
+            min_dist_cap=self.min_dist_cap,
+            min_dist_floor=self.min_dist_floor
+        )
+        proba[:, 1] = adjusted
+        proba[:, 0] = 1.0 - adjusted
+        return proba
+
+    def predict(self, X):
+        proba = self.predict_proba(X)[:, 1]
+        return (proba >= 0.5).astype(int)
+
+    def __getattr__(self, name):
+        try:
+            model = object.__getattribute__(self, "model")
+        except AttributeError:
+            raise AttributeError(name)
+        return getattr(model, name)
+
 class PassingModel:
     """
     Passing success model with defensive context and player individuality

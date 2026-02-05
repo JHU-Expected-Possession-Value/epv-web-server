@@ -1,0 +1,14 @@
+feature,mean_abs_shap
+player_finishing_skill,0.039254523804136396
+distance_to_goal,0.03494365516605507
+angle_to_goal,0.03132516613130264
+speed_avg,0.023779408668302665
+pitch_control,0.017880209870123624
+last_defensive_line_height,0.014946407459964419
+last_defensive_line_x,0.014251634565904076
+penalty_area,0.011107205118083956
+distance_covered,0.009523259501366557
+trajectory_angle,0.009369722549930022
+defenders_within_3m,0.0033877996990192456
+inside_defensive_shape,0.003386590000172778
+defenders_in_triangle,0.003297651725454421

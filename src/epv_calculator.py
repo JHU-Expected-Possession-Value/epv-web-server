@@ -445,10 +445,14 @@ class EPVCalculator:
         # Pitch control at origin and destination
         pc_origin = 0.5
         pc_dest = 0.5
+        pc_path_min = 0.5
         if self.pc_runner and frame > 0:
             try:
                 pc_origin = self.pc_runner.pc_at_point(frame, x_origin, y_origin)
                 pc_dest = self.pc_runner.pc_at_point(frame, x_dest, y_dest)
+                pc_path_min = self._pitch_control_path_min(
+                    x_origin, y_origin, x_dest, y_dest, frame
+                )
             except:
                 pass
 
@@ -460,6 +464,9 @@ class EPVCalculator:
             x_dest, y_dest, frame_data, team_id, distance=3.0
         )
         defenders_in_lane = self._count_defenders_in_passing_lane(
+            x_origin, y_origin, x_dest, y_dest, frame_data, team_id
+        )
+        min_defender_dist_to_lane = self._min_defender_dist_to_passing_lane(
             x_origin, y_origin, x_dest, y_dest, frame_data, team_id
         )
 
@@ -486,8 +493,10 @@ class EPVCalculator:
             'defenders_near_origin': defenders_near_origin,
             'defenders_near_dest': defenders_near_dest,
             'defenders_in_lane': defenders_in_lane,
+            'min_defender_dist_to_lane': min_defender_dist_to_lane,
             'pitch_control_origin': pc_origin,
             'pitch_control_dest': pc_dest,
+            'pitch_control_path_min': pc_path_min,
             'player_passing_skill': player_passing_skill,
             'speed_avg': speed_avg,
             'inside_defensive_shape': inside_defensive_shape,
@@ -866,6 +875,98 @@ class EPVCalculator:
                 count += 1
 
         return count
+
+    def _min_defender_dist_to_passing_lane(
+        self,
+        x_origin: float,
+        y_origin: float,
+        x_dest: float,
+        y_dest: float,
+        frame_data: Dict,
+        team_id: int,
+        default_distance: float = 50.0
+    ) -> float:
+        """Compute minimum perpendicular distance of any defender to the pass lane."""
+        if not frame_data or 'player_data' not in frame_data:
+            return default_distance
+
+        if not self.current_team_roster:
+            return default_distance
+
+        opponent_team_ids = [tid for tid in self.current_team_roster.keys() if tid != team_id]
+        if not opponent_team_ids:
+            return default_distance
+
+        opponent_players = set()
+        for opp_team_id in opponent_team_ids:
+            opponent_players.update(self.current_team_roster[opp_team_id])
+
+        pass_dx = x_dest - x_origin
+        pass_dy = y_dest - y_origin
+        pass_length = np.sqrt(pass_dx**2 + pass_dy**2)
+        if pass_length < 0.1:
+            return default_distance
+
+        min_dist = None
+        for player in frame_data.get('player_data', []):
+            if not player.get('is_detected', False):
+                continue
+
+            player_id = player['player_id']
+            if player_id not in opponent_players:
+                continue
+
+            px = player['x']
+            py = player['y']
+
+            to_player_x = px - x_origin
+            to_player_y = py - y_origin
+
+            projection = (to_player_x * pass_dx + to_player_y * pass_dy) / pass_length
+            if projection < 0 or projection > pass_length:
+                continue
+
+            perp_dist = abs(to_player_x * pass_dy - to_player_y * pass_dx) / pass_length
+            if min_dist is None or perp_dist < min_dist:
+                min_dist = perp_dist
+
+        return float(min_dist) if min_dist is not None else default_distance
+
+    def _pitch_control_path_min(
+        self,
+        x_origin: float,
+        y_origin: float,
+        x_dest: float,
+        y_dest: float,
+        frame: int,
+        n_samples: int = 5
+    ) -> float:
+        """Compute minimum pitch control along the pass line segment."""
+        if not self.pc_runner or frame <= 0:
+            return 0.5
+
+        pass_dx = x_dest - x_origin
+        pass_dy = y_dest - y_origin
+        pass_length = np.sqrt(pass_dx**2 + pass_dy**2)
+        if pass_length < 0.5:
+            try:
+                pc_origin = self.pc_runner.pc_at_point(frame, x_origin, y_origin)
+                pc_dest = self.pc_runner.pc_at_point(frame, x_dest, y_dest)
+                return float(min(pc_origin, pc_dest))
+            except Exception:
+                return 0.5
+
+        fractions = np.linspace(0.2, 0.8, n_samples)
+        values = []
+        for frac in fractions:
+            x = x_origin + frac * pass_dx
+            y = y_origin + frac * pass_dy
+            try:
+                values.append(self.pc_runner.pc_at_point(frame, x, y))
+            except Exception:
+                continue
+
+        return float(min(values)) if values else 0.5
 
     def _evaluate_dribble_with_model(
         self,

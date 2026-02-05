@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 import json
 import pickle
+import sys
 from pathlib import Path
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split, StratifiedGroupKFold
@@ -22,6 +23,26 @@ from sklearn.metrics import (
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple
 import glob
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from xg_model import (
+    DampedXGModel,
+    XG_DISTANCE_DAMPEN_METERS,
+    XG_DISTANCE_DAMPEN_FACTOR,
+    XG_DISTANCE_DECAY,
+    XG_HARD_ANGLE_DEG,
+    XG_HARD_ANGLE_FACTOR
+)
+try:
+    from pitch_control import PitchControlRunner, load_match_meta_robust, load_tracking_jsonl
+    PITCH_CONTROL_AVAILABLE = True
+except ImportError:
+    print("⚠️  Warning: Could not import pitch_control module")
+    print("   Pitch control feature will be set to 0.5 (neutral)")
+    PITCH_CONTROL_AVAILABLE = False
+    PitchControlRunner = None
+    load_match_meta_robust = None
+    load_tracking_jsonl = None
 
 
 def load_tracking_data(tracking_path: Path) -> Dict:
@@ -163,27 +184,32 @@ def calculate_defenders_within_distance(
     return defender_count
 
 
-def calculate_distance_to_goal(x: float, y: float, attacking_direction: str) -> float:
-    """Calculate distance from position to goal center.
+def goal_x_from_attacking_side(attacking_side: str, pitch_half: float = 52.5) -> float:
+    """Resolve attacking goal x-position based on per-shot attacking side."""
+    side = str(attacking_side).lower()
+    if "right_to_left" in side:
+        return -pitch_half
+    if "left_to_right" in side:
+        return pitch_half
+    return pitch_half
 
-    NOTE: SkillCorner coordinates are PRE-NORMALIZED!
-    x is always relative to attacking direction, so goal is ALWAYS at +52.5
-    """
-    goal_x = 52.5  # Always attacking toward right goal (coordinates are normalized)
-    goal_y = 0.0
 
+def normalize_x_by_attacking_side(x: float, attacking_side: str) -> float:
+    """Align x to absolute field coordinates based on attacking side."""
+    side = str(attacking_side).lower()
+    if "right_to_left" in side:
+        return -abs(x)
+    return x
+
+
+def calculate_distance_to_goal(x: float, y: float, goal_x: float, goal_y: float = 0.0) -> float:
+    """Calculate distance from position to goal center."""
     distance = np.sqrt((x - goal_x)**2 + (y - goal_y)**2)
     return distance
 
 
-def calculate_angle_to_goal(x: float, y: float, attacking_direction: str) -> float:
-    """Calculate angle to goal (in degrees).
-
-    NOTE: SkillCorner coordinates are PRE-NORMALIZED!
-    Goal is ALWAYS at +52.5
-    """
-    goal_x = 52.5  # Always attacking toward right goal
-
+def calculate_angle_to_goal(x: float, y: float, goal_x: float) -> float:
+    """Calculate angle to goal (in degrees)."""
     # Goal posts at +/- 3.66m from center
     post1_y = -3.66
     post2_y = 3.66
@@ -192,8 +218,10 @@ def calculate_angle_to_goal(x: float, y: float, attacking_direction: str) -> flo
     angle1 = np.arctan2(post1_y - y, goal_x - x)
     angle2 = np.arctan2(post2_y - y, goal_x - x)
 
-    # Angle between the two posts (in degrees)
+    # Angle between the two posts (in degrees), wrapped to [0, 180]
     angle = abs(np.degrees(angle2 - angle1))
+    if angle > 180:
+        angle = 360 - angle
 
     return angle
 
@@ -222,7 +250,10 @@ def extract_shot_features(data_dir: Path, max_matches: int = None) -> pd.DataFra
     player_skills = load_player_finishing_skills()
 
     # Find all dynamic event files
-    event_files = list(data_dir.glob("*_dynamic_events.csv"))
+    event_files = sorted(
+        f for f in data_dir.glob("*_dynamic_events.csv")
+        if not f.name.startswith("._")
+    )
 
     if max_matches:
         event_files = event_files[:max_matches]
@@ -268,6 +299,21 @@ def extract_shot_features(data_dir: Path, max_matches: int = None) -> pd.DataFra
             print(f"  ⚠️  Error loading tracking for {match_id}: {e}")
             continue
 
+        # Initialize PitchControlRunner for this match
+        pc_runner = None
+        if PITCH_CONTROL_AVAILABLE:
+            try:
+                match_json = data_dir / f"match_{match_id}.json"
+                if match_json.exists():
+                    meta = load_match_meta_robust(match_json)
+                    frames = load_tracking_jsonl(tracking_file)
+                    pc_runner = PitchControlRunner(meta, frames)
+                    print(f"  ✓ Pitch control initialized for {match_id}")
+                else:
+                    print(f"  ⚠️  No match.json for {match_id}, using neutral PC")
+            except Exception as e:
+                print(f"  ⚠️  Could not initialize pitch control for {match_id}: {e}")
+
         print(f"  Processing {match_id}: {len(shots)} shots")
 
         # Extract features for each shot
@@ -278,11 +324,8 @@ def extract_shot_features(data_dir: Path, max_matches: int = None) -> pd.DataFra
             team_id = shot.get('team_id')
             player_id = shot.get('player_id')
             attacking_side = shot.get('attacking_side', 'left_to_right')
-
-            # SkillCorner coordinates are PRE-NORMALIZED!
-            # x_start is always relative to attacking direction
-            # So goal is ALWAYS at +52.5 regardless of attacking_side
-            goal_x = 52.5
+            x_start = normalize_x_by_attacking_side(x_start, attacking_side)
+            goal_x = goal_x_from_attacking_side(attacking_side)
 
             # Get tracking data for this frame
             frame_data = tracking_dict.get(frame_start, {})
@@ -297,11 +340,21 @@ def extract_shot_features(data_dir: Path, max_matches: int = None) -> pd.DataFra
             )
 
             # Calculate distance and angle to goal
-            distance_to_goal = calculate_distance_to_goal(x_start, y_start, attacking_side)
-            angle_to_goal = calculate_angle_to_goal(x_start, y_start, attacking_side)
+            distance_to_goal = calculate_distance_to_goal(x_start, y_start, goal_x)
+            angle_to_goal = calculate_angle_to_goal(x_start, y_start, goal_x)
 
             # Get player finishing skill
             player_finishing_skill = player_skills.get(player_id, 0.0)
+
+            # Pitch control at shot location
+            pitch_control = 0.5
+            if pc_runner is not None and pd.notna(frame_start):
+                try:
+                    frame_idx = int(frame_start)
+                    if frame_idx > 0:
+                        pitch_control = float(pc_runner.pc_at_point(frame_idx, float(x_start), float(y_start)))
+                except Exception:
+                    pitch_control = 0.5
 
             # Determine if goal was scored
             game_interruption_after = shot.get('game_interruption_after', '')
@@ -328,6 +381,7 @@ def extract_shot_features(data_dir: Path, max_matches: int = None) -> pd.DataFra
                 'defenders_in_triangle': defenders_in_triangle,
                 'defenders_within_3m': defenders_within_3m,
                 'player_finishing_skill': player_finishing_skill,
+                'pitch_control': pitch_control,
                 'penalty_area': int(penalty_area) if pd.notna(penalty_area) else 0,
                 'trajectory_angle': trajectory_angle if pd.notna(trajectory_angle) else 0.0,
                 'distance_covered': distance_covered if pd.notna(distance_covered) else 0.0,
@@ -405,7 +459,7 @@ def main():
 
     # Extract features
     print("\n[1/5] Extracting shot features with tracking data...")
-    shots_df = extract_shot_features(data_dir, max_matches=None)  # Use all available matches
+    shots_df = extract_shot_features(data_dir, max_matches=150)
 
     print(f"\nExtracted features for {len(shots_df)} shots")
     print(f"   Goals scored: {shots_df['goal'].sum()} ({shots_df['goal'].mean():.1%})")
@@ -423,16 +477,16 @@ def main():
     print(f"     defenders_within_3m: mean={shots_df['defenders_within_3m'].mean():.2f}, max={shots_df['defenders_within_3m'].max()}")
     print(f"     player_finishing_skill: mean={shots_df['player_finishing_skill'].mean():.2f}, max={shots_df['player_finishing_skill'].max():.2f}")
 
-    # Prepare features - KEEP IT SIMPLE like partner's model!
-    # Remove confusing tracking features that hurt performance
+    # Prepare features (use all available tracking and context features)
     feature_cols = [
         'distance_to_goal', 'angle_to_goal',
         'penalty_area', 'trajectory_angle', 'distance_covered',
         'speed_avg',
-        'player_finishing_skill'  # Only individuality feature
-        # REMOVED: defenders_in_triangle, defenders_within_3m (confusing)
-        # REMOVED: last_defensive_line_x, last_defensive_line_height (confusing)
-        # REMOVED: inside_defensive_shape (confusing)
+        'defenders_in_triangle', 'defenders_within_3m',
+        'inside_defensive_shape',
+        'last_defensive_line_x', 'last_defensive_line_height',
+        'pitch_control',
+        'player_finishing_skill'
     ]
 
     X = shots_df[feature_cols].fillna(0).values
@@ -538,14 +592,31 @@ def main():
     model_file = Path("models/xg_model_improved.pkl")
     model_file.parent.mkdir(exist_ok=True)
 
+    damped_model = DampedXGModel(
+        model,
+        feature_cols,
+        distance_threshold=XG_DISTANCE_DAMPEN_METERS,
+        distance_factor=XG_DISTANCE_DAMPEN_FACTOR,
+        distance_decay=XG_DISTANCE_DECAY,
+        angle_threshold=XG_HARD_ANGLE_DEG,
+        angle_factor=XG_HARD_ANGLE_FACTOR
+    )
+
     with open(model_file, 'wb') as f:
         pickle.dump({
-            'model': model,
+            'model': damped_model,
             'feature_cols': feature_cols,
             'train_accuracy': accuracy_score(y_train, y_train_pred),
             'test_accuracy': accuracy_score(y_test, y_test_pred),
             'test_auc': roc_auc_score(y_test, y_test_proba),
-            'test_ece': test_ece
+            'test_ece': test_ece,
+            'dampening': {
+                'distance_threshold_m': XG_DISTANCE_DAMPEN_METERS,
+                'distance_factor': XG_DISTANCE_DAMPEN_FACTOR,
+                'distance_decay': XG_DISTANCE_DECAY,
+                'angle_threshold_deg': XG_HARD_ANGLE_DEG,
+                'angle_factor': XG_HARD_ANGLE_FACTOR
+            }
         }, f)
 
     print(f"   ✅ Model saved to {model_file}")
