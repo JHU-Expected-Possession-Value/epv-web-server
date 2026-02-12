@@ -1,0 +1,302 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  background: #1a1a1a;
+  color: #eee;
+  padding: 0.5rem 1rem;
+  font-size: 14px;
+}
+
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  grid-template-rows: auto auto auto;
+  gap: 0.75rem;
+  align-items: start;
+  min-height: 0;
+}
+
+.pitch-section {
+  grid-column: 1;
+  grid-row: 2 / 4;
+  min-width: 0;
+}
+
+.theta-section {
+  grid-column: 2;
+  grid-row: 2;
+}
+
+.epv-section {
+  grid-column: 2;
+  grid-row: 3;
+}
+
+.demo-header {
+  grid-column: 1 / -1;
+  margin: 0 0 0.25rem;
+}
+
+.demo-header h1 {
+  margin: 0;
+  font-size: 1.35rem;
+}
+
+.demo-subtitle {
+  margin: 0.15rem 0 0;
+  color: #8a9a8e;
+  font-size: 0.9rem;
+}
+
+h2 {
+  font-size: 0.95rem;
+  margin-bottom: 0.35rem;
+}
+
+.pitch-wrap {
+  position: relative;
+  max-width: 100%;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid #333;
+}
+
+.pitch-wrap::before {
+  content: "";
+  display: block;
+  padding-bottom: 52%;
+}
+
+.pitch-wrap .pitch {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: default;
+}
+
+.pitch-helper {
+  margin: 0.35rem 0 0.5rem;
+  color: #6a7a6e;
+  font-size: 0.8rem;
+  line-height: 1.3;
+}
+
+.reset-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.5rem;
+}
+
+.reset-buttons button {
+  margin: 0;
+  padding: 0.35rem 0.6rem;
+  font-size: 0.85rem;
+}
+
+.player-circle {
+  cursor: grab;
+  transition: stroke-width 0.1s;
+}
+
+.player-circle:hover {
+  stroke-width: 0.6;
+}
+
+.player-circle:active {
+  cursor: grabbing;
+}
+
+.player-circle.home {
+  fill: #4a9eff;
+  stroke: #2a7edf;
+  stroke-width: 0.4;
+}
+
+.player-circle.away {
+  fill: #e85d5d;
+  stroke: #c84a4a;
+  stroke-width: 0.4;
+}
+
+.player-circle.has-ball {
+  stroke: #ffeb3b;
+  stroke-width: 1.1;
+  filter: drop-shadow(0 0 2px rgba(255, 235, 59, 0.9)) drop-shadow(0 0 4px rgba(255, 235, 59, 0.4));
+}
+
+.player-circle.has-ball:hover {
+  stroke-width: 1.3;
+}
+
+.player-arrow {
+  fill: rgba(0, 0, 0, 0.35);
+  stroke: none;
+  pointer-events: none;
+}
+
+.player-group.home .player-arrow {
+  fill: rgba(0, 0, 0, 0.4);
+}
+
+.player-group.away .player-arrow {
+  fill: rgba(0, 0, 0, 0.4);
+}
+
+.player-group.has-ball .player-arrow {
+  fill: rgba(255, 235, 59, 0.6);
+}
+
+.pass-arrow-line {
+  stroke: #ffeb3b;
+  stroke-width: 0.5;
+  stroke-dasharray: 3 2;
+  fill: none;
+  pointer-events: none;
+}
+
+.pass-candidate-circle {
+  fill: rgba(255, 235, 59, 0.25);
+  stroke: rgba(255, 235, 59, 0.6);
+  stroke-width: 0.35;
+  pointer-events: none;
+}
+
+.theta-section {
+  padding: 0.65rem 0.75rem;
+  background: #252525;
+  border-radius: 6px;
+  border: 1px solid #333;
+}
+
+.theta-section h2 {
+  margin-top: 0;
+}
+
+.theta-hint {
+  margin: 0 0 0.35rem;
+  color: #999;
+  font-size: 0.8rem;
+}
+
+.hidden {
+  display: none;
+}
+
+.theta-controls.hidden {
+  display: none;
+}
+
+.theta-controls label {
+  display: block;
+  margin-bottom: 0.35rem;
+}
+
+.theta-controls input[type="range"] {
+  width: 100%;
+  max-width: 100%;
+  margin-right: 0.5rem;
+  vertical-align: middle;
+}
+
+.theta-value {
+  display: inline-block;
+  min-width: 4ch;
+  font-family: ui-monospace, monospace;
+  font-size: 0.9rem;
+}
+
+.theta-buttons {
+  margin-top: 0.35rem;
+}
+
+.theta-buttons button {
+  margin-right: 0.4rem;
+  margin-top: 0;
+  padding: 0.35rem 0.6rem;
+  font-size: 0.85rem;
+}
+
+.epv-section {
+  padding: 0.65rem 0.75rem;
+  background: #252525;
+  border-radius: 6px;
+  border: 1px solid #333;
+}
+
+.epv-profile-row {
+  margin-bottom: 0.5rem;
+}
+
+.epv-profile-row label {
+  display: block;
+  margin-bottom: 0.2rem;
+  font-size: 0.85rem;
+}
+
+.epv-profile-row select {
+  width: 100%;
+  max-width: 100%;
+  padding: 0.35rem 0.45rem;
+  background: #1a1a1a;
+  border: 1px solid #333;
+  border-radius: 6px;
+  color: #eee;
+  font: inherit;
+  font-size: 0.9rem;
+}
+
+.epv-status {
+  margin: 0 0 0.35rem;
+  color: #8a9;
+  font-size: 0.85rem;
+}
+
+.epv-status.hidden {
+  display: none;
+}
+
+#epv-output p {
+  margin: 0.35rem 0;
+  font-size: 0.9rem;
+}
+
+#epv-output span {
+  font-weight: 600;
+}
+
+button {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.9rem;
+  cursor: pointer;
+  background: #4a9;
+  color: #000;
+  border: none;
+  border-radius: 6px;
+}
+
+button:hover {
+  background: #5bb;
+}
+
+@media (max-width: 768px) {
+  .container {
+    grid-template-columns: 1fr;
+    grid-template-rows: none;
+  }
+  .pitch-section,
+  .theta-section,
+  .epv-section {
+    grid-column: 1;
+    grid-row: auto;
+  }
+}

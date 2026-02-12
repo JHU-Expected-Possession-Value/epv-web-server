@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Interactive EPV Demo</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <header class="demo-header">
+      <h1>Interactive EPV Demo</h1>
+      <p class="demo-subtitle">Interactive Expected Possession Value Simulator</p>
+    </header>
+
+    <section class="pitch-section">
+      <h2>Pitch (105 × 68)</h2>
+      <div class="pitch-wrap">
+        <svg id="pitch" class="pitch" viewBox="0 0 105 68" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <linearGradient id="grass" x1="0%" y1="0%" x2="0%" y2="100%">
+              <stop offset="0%" stop-color="#2d5a27" />
+              <stop offset="100%" stop-color="#1e3d1a" />
+            </linearGradient>
+            <marker id="pass-arrowhead" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+              <polygon points="0 0, 6 3, 0 6" fill="#ffeb3b" stroke="#b3a000" stroke-width="0.4" />
+            </marker>
+          </defs>
+          <rect width="105" height="68" fill="url(#grass)" />
+          <rect x="0" y="0" width="105" height="68" fill="none" stroke="#fff" stroke-width="0.5" />
+          <line x1="52.5" y1="0" x2="52.5" y2="68" stroke="#fff" stroke-width="0.5" />
+          <circle cx="52.5" cy="34" r="9.15" fill="none" stroke="#fff" stroke-width="0.5" />
+          <circle cx="52.5" cy="34" r="0.5" fill="#fff" />
+          <rect x="0" y="13.84" width="16.5" height="40.32" fill="none" stroke="#fff" stroke-width="0.5" />
+          <rect x="0" y="29.6" width="5.5" height="8.8" fill="none" stroke="#fff" stroke-width="0.5" />
+          <rect x="88.5" y="13.84" width="16.5" height="40.32" fill="none" stroke="#fff" stroke-width="0.5" />
+          <rect x="99.5" y="29.6" width="5.5" height="8.8" fill="none" stroke="#fff" stroke-width="0.5" />
+          <g id="players-layer"></g>
+          <g id="pass-viz-layer"></g>
+        </svg>
+      </div>
+      <p class="pitch-helper">Drag players. Click a player to give them the ball. Adjust facing direction.</p>
+      <div class="reset-buttons">
+        <button type="button" id="reset-all">Reset All</button>
+        <button type="button" id="reset-433">Reset to 4-3-3</button>
+        <button type="button" id="reset-442">Reset to 4-4-2</button>
+      </div>
+    </section>
+
+    <section class="theta-section">
+      <h2>Facing direction</h2>
+      <p id="theta-hint" class="theta-hint">Select a player (give them the ball) to adjust facing.</p>
+      <div id="theta-controls" class="theta-controls hidden">
+        <label>
+          <span>θ (radians)</span>
+          <input type="range" id="theta-slider" min="-314" max="314" value="0" step="1" />
+        </label>
+        <span id="theta-value" class="theta-value">0.00</span>
+        <div class="theta-buttons">
+          <button type="button" id="theta-left">↶ Left</button>
+          <button type="button" id="theta-right">↷ Right</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="epv-section">
+      <h2>EPV Output</h2>
+      <div class="epv-profile-row">
+        <label for="ball-owner-profile">Ball Owner Profile</label>
+        <select id="ball-owner-profile">
+          <option value="average">Average</option>
+          <option value="elite_passer">Elite passer</option>
+          <option value="elite_finisher">Elite finisher</option>
+          <option value="elite_dribbler">Elite dribbler</option>
+        </select>
+      </div>
+      <p id="epv-status" class="epv-status hidden">Updating…</p>
+      <div id="epv-output">
+        <p>EPV: <span id="epv-value">—</span></p>
+        <p>Best action: <span id="best-action">—</span></p>
+        <p>Q shoot: <span id="q-shoot">—</span></p>
+        <p>Q pass: <span id="q-pass">—</span></p>
+        <p>Q dribble: <span id="q-dribble">—</span></p>
+      </div>
+    </section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

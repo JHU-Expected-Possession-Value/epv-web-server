@@ -45,6 +45,15 @@ EPV_SARG/
 │   ├── player_id_to_passing_skill.csv
 │   └── player_id_to_skill.csv
 │
+├── api/                           # Demo backend
+│   ├── main.py                    # FastAPI app
+│   └── requirements.txt
+│
+├── ui/                            # Demo frontend
+│   ├── index.html
+│   ├── style.css
+│   └── app.js
+│
 └── results/                       # Example visualizations
     ├── scenario1_edge_box_clear_arrows.png
     ├── scenario2_wide_position_clear_arrows.png
@@ -54,7 +63,37 @@ EPV_SARG/
     └── shot_with_tracking_alt.png
 ```
 
-## Quick Start
+## Running the interactive EPV demo
+
+### Backend (API)
+
+From the **repo root**:
+
+```bash
+pip install -r api/requirements.txt
+uvicorn api.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+- Health: [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health)
+- EPV: `POST http://127.0.0.1:8000/api/epv` (returns placeholder EPV values)
+
+### Frontend (UI)
+
+Serve the `ui` folder with any static file server, then open the page in a browser. From the **repo root**:
+
+```bash
+# Option 1: Python
+python3 -m http.server 3000 --directory ui
+
+# Option 2: npx (if Node is installed)
+npx serve ui -p 3000
+```
+
+Then open [http://localhost:3000](http://localhost:3000). Click **Fetch EPV** to call the backend and display the EPV output.
+
+**Note:** The API runs on port 8000 and allows CORS from `http://localhost:3000`. Start the backend before using the frontend.
+
+## Quick Start (core project)
 
 ### Installation
 
