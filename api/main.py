@@ -1,16 +1,29 @@
 import math
+import os
 import sys
 from pathlib import Path
 from typing import List, Literal, Optional, Union
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
 
+# Load environment variables from .env file
+load_dotenv()
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 MODELS_DIR = REPO_ROOT / "models"
-DATA_DIR = REPO_ROOT / "data"
+
+# Read EPV_DATA_DIR from environment (required)
+EPV_DATA_DIR = os.getenv("EPV_DATA_DIR")
+if not EPV_DATA_DIR:
+    raise RuntimeError(
+        "EPV_DATA_DIR environment variable must be set. "
+        "Please set it in your .env file or environment."
+    )
+DATA_DIR = Path(EPV_DATA_DIR)
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -30,6 +43,11 @@ GOAL_X_CENTER = 52.5
 GOAL_Y_CENTER = 0.0
 
 app = FastAPI()
+
+# Mount routers
+from api.routers import replay
+
+app.include_router(replay.router, prefix="/replay", tags=["replay"])
 
 # --- Player profile registry (from skill CSVs), keyed by profile_id (string), cached at startup ---
 _player_registry: Optional[List[dict]] = None
@@ -130,9 +148,14 @@ def _get_registry_by_profile_id() -> dict:
         _load_player_registry()
     return _registry_by_profile_id or {}
 
+# Read ALLOWED_ORIGINS from environment (optional, default includes common localhost variants)
+# Supports comma-separated list: "http://localhost:3000,http://127.0.0.1:3000"
+allowed_origins_str = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+allowed_origins = [origin.strip() for origin in allowed_origins_str.split(",") if origin.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
