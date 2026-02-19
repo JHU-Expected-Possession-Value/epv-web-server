@@ -59,6 +59,35 @@ h2 {
   margin-bottom: 0.35rem;
 }
 
+.profile-popover {
+  position: absolute;
+  z-index: 10;
+  background: #2a2a2a;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 0.4rem 0.5rem;
+  min-width: 140px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+.profile-popover.hidden {
+  display: none;
+}
+.profile-popover-label {
+  display: block;
+  font-size: 0.75rem;
+  color: #9ab;
+  margin-bottom: 0.25rem;
+}
+.profile-popover-select {
+  width: 100%;
+  padding: 0.25rem;
+  font-size: 0.8rem;
+  background: #1a1a1a;
+  color: #eee;
+  border: 1px solid #555;
+  border-radius: 3px;
+}
+
 .pitch-wrap {
   position: relative;
   max-width: 100%;
@@ -272,6 +301,22 @@ h2 {
 
 #epv-output span {
   font-weight: 600;
+}
+
+.epv-reason {
+  margin-top: 0.25rem;
+}
+
+.epv-action-detail {
+  margin: 0.2rem 0 0;
+  font-size: 0.9rem;
+  color: #b0b0b0;
+}
+
+.epv-profile-info {
+  margin: 0.35rem 0 0;
+  font-size: 0.85rem;
+  color: #9ab;
 }
 
 button {

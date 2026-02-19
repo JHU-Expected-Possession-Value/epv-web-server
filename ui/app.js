@@ -24,6 +24,9 @@
   const qShootEl = document.getElementById("q-shoot");
   const qPassEl = document.getElementById("q-pass");
   const qDribbleEl = document.getElementById("q-dribble");
+  const bestActionReasonEl = document.getElementById("best-action-reason");
+  const epvActionDetailEl = document.getElementById("epv-action-detail");
+  const epvProfileInfoEl = document.getElementById("epv-profile-info");
   const passVizLayer = document.getElementById("pass-viz-layer");
 
   function rad2deg(rad) {
@@ -120,6 +123,9 @@
 
   function resetToFormation(getPlayers) {
     state.players = getPlayers();
+    state.playerProfileIds = {};
+    state.profilePopoverPlayerId = null;
+    hideProfilePopover();
     var profileEl = document.getElementById("ball-owner-profile");
     if (profileEl) profileEl.value = "average";
     renderPlayers();
@@ -129,12 +135,88 @@
 
   let state = {
     players: createInitialPlayers(),
+    playerProfiles: [],
+    playerProfileIds: {},
+    profilePopoverPlayerId: null,
     drag: null,
     epvDebounceTimer: null,
   };
 
+  function loadPlayerProfiles() {
+    fetch(API_BASE + "/players")
+      .then(function (res) { return res.ok ? res.json() : []; })
+      .then(function (list) {
+        state.playerProfiles = Array.isArray(list) ? list : [];
+        const sel = document.getElementById("ball-owner-profile");
+        if (!sel) return;
+        while (sel.options.length > 1) sel.remove(1);
+        state.playerProfiles.forEach(function (pro) {
+          const opt = document.createElement("option");
+          opt.value = String(pro.player_id);
+          opt.textContent = pro.display_name || "Player " + pro.player_id;
+          sel.appendChild(opt);
+        });
+      })
+      .catch(function () { state.playerProfiles = []; });
+  }
+
   function getBallOwner() {
     return state.players.find((p) => p.hasBall) || null;
+  }
+
+  function getProfilePopoverEl() {
+    return document.getElementById("profile-popover");
+  }
+
+  function getPerPlayerProfileSelect() {
+    return document.getElementById("per-player-profile");
+  }
+
+  function hideProfilePopover() {
+    const el = getProfilePopoverEl();
+    if (el) {
+      el.classList.add("hidden");
+    }
+    state.profilePopoverPlayerId = null;
+  }
+
+  function showProfilePopover(player) {
+    const pop = getProfilePopoverEl();
+    const sel = getPerPlayerProfileSelect();
+    if (!pop || !sel) return;
+    state.profilePopoverPlayerId = player.id;
+    pop.style.left = (player.x / 105) * 100 + "%";
+    pop.style.top = ((player.y + 5) / 68) * 100 + "%";
+    sel.innerHTML = "";
+    const optAverage = document.createElement("option");
+    optAverage.value = "average";
+    optAverage.textContent = "Average";
+    sel.appendChild(optAverage);
+    state.playerProfiles.forEach(function (pro) {
+      const opt = document.createElement("option");
+      opt.value = String(pro.player_id);
+      opt.textContent = pro.display_name || pro.label || "Player " + pro.player_id;
+      sel.appendChild(opt);
+    });
+    sel.value = state.playerProfileIds[player.id] || "average";
+    pop.classList.remove("hidden");
+    sel.focus();
+  }
+
+  function setupProfilePopoverListeners() {
+    const sel = getPerPlayerProfileSelect();
+    if (!sel) return;
+    sel.addEventListener("change", function () {
+      const pid = state.profilePopoverPlayerId;
+      if (!pid) return;
+      const val = sel.value;
+      if (val === "average") {
+        delete state.playerProfileIds[pid];
+      } else {
+        state.playerProfileIds[pid] = val;
+      }
+      requestEpvUpdate();
+    });
   }
 
   function clientToPitch(clientX, clientY) {
@@ -211,13 +293,13 @@
   function buildEpvPayload() {
     const owner = getBallOwner();
     const profileEl = document.getElementById("ball-owner-profile");
-    const ballOwnerProfile = profileEl ? profileEl.value : "average";
+    const ballOwnerProfileValue = profileEl ? profileEl.value : "average";
     return {
       frame: 0,
       possessionTeam: owner ? owner.team : "home",
       ballOwnerId: owner ? owner.id : "",
       players: state.players.map(function (p) {
-        return {
+        const out = {
           id: p.id,
           team: p.team,
           x: p.x,
@@ -225,8 +307,15 @@
           theta: p.theta,
           hasBall: p.hasBall,
         };
+        var perDot = state.playerProfileIds[p.id];
+        if (perDot != null && perDot !== "average") {
+          out.profile_id = perDot;
+        } else if (p.hasBall && ballOwnerProfileValue && ballOwnerProfileValue !== "average") {
+          out.profile_id = ballOwnerProfileValue;
+        }
+        return out;
       }),
-      ballOwnerProfile: ballOwnerProfile,
+      ballOwnerProfile: ballOwnerProfileValue === "average" ? "average" : "average",
     };
   }
 
@@ -236,7 +325,44 @@
     qShootEl.textContent = data.q_shoot != null ? data.q_shoot.toFixed(3) : "—";
     qPassEl.textContent = data.q_pass != null ? data.q_pass.toFixed(3) : "—";
     qDribbleEl.textContent = data.q_dribble != null ? data.q_dribble.toFixed(3) : "—";
+    if (bestActionReasonEl) {
+      bestActionReasonEl.textContent = data.best_action_reason != null ? data.best_action_reason : "—";
+    }
+    if (epvActionDetailEl) {
+      let line = "";
+      if (data.best_action === "pass" && (data.chosen_receiver_id != null || data.chosen_pass_risk != null)) {
+        line = "Receiver: " + (data.chosen_receiver_id != null ? data.chosen_receiver_id : "—") +
+          ", risk: " + (data.chosen_pass_risk != null ? data.chosen_pass_risk.toFixed(2) : "—");
+      } else if (data.best_action === "shoot" && data.explain && data.explain.shoot) {
+        var s = data.explain.shoot;
+        line = "Pressure: " + (s.shot_pressure_multiplier != null ? s.shot_pressure_multiplier.toFixed(2) : "—") +
+          ", blocked: " + (s.shot_blocked != null ? s.shot_blocked : "—");
+      } else if (data.best_action === "dribble" && data.explain && data.explain.dribble) {
+        var d = data.explain.dribble;
+        line = "Open space: " + (d.dribble_open_space_m != null ? d.dribble_open_space_m.toFixed(1) + " m" : "—");
+      }
+      epvActionDetailEl.textContent = line;
+    }
+    if (epvProfileInfoEl) {
+      const prof = data.explain && data.explain.profile;
+      if (prof && (prof.display_name != null || (prof.position != null && prof.position !== "") || prof.overall_individuality_score != null)) {
+        const parts = [];
+        if (prof.display_name != null && prof.display_name !== "") parts.push(prof.display_name);
+        if (prof.position != null && prof.position !== "") parts.push("Position: " + prof.position);
+        if (prof.overall_individuality_score != null) parts.push("Individuality: " + prof.overall_individuality_score.toFixed(2));
+        epvProfileInfoEl.textContent = parts.join(" · ");
+        epvProfileInfoEl.style.display = "";
+      } else {
+        epvProfileInfoEl.textContent = "";
+        epvProfileInfoEl.style.display = "none";
+      }
+    }
     renderPassViz(data);
+  }
+
+  function getGoalCenterForTeam(team) {
+    if (team === "away") return { x: 0, y: PITCH_HEIGHT / 2 };
+    return { x: PITCH_WIDTH, y: PITCH_HEIGHT / 2 };
   }
 
   function renderPassViz(data) {
@@ -244,20 +370,13 @@
     passVizLayer.innerHTML = "";
     const ns = "http://www.w3.org/2000/svg";
     const owner = getBallOwner();
-    if (
-      data.best_action === "pass" &&
-      data.best_pass_target != null &&
-      owner != null
-    ) {
-      const x1 = owner.x;
-      const y1 = owner.y;
-      const x2 = data.best_pass_target.x;
-      const y2 = data.best_pass_target.y;
+
+    if (owner != null && data.best_action_target != null) {
       const line = document.createElementNS(ns, "line");
-      line.setAttribute("x1", x1);
-      line.setAttribute("y1", y1);
-      line.setAttribute("x2", x2);
-      line.setAttribute("y2", y2);
+      line.setAttribute("x1", owner.x);
+      line.setAttribute("y1", owner.y);
+      line.setAttribute("x2", data.best_action_target.x);
+      line.setAttribute("y2", data.best_action_target.y);
       line.setAttribute("class", "pass-arrow-line");
       line.setAttribute("marker-end", "url(#pass-arrowhead)");
       passVizLayer.appendChild(line);
@@ -355,6 +474,7 @@
         requestEpvUpdate();
       });
     }
+    loadPlayerProfiles();
   })();
 
   thetaSlider.addEventListener("input", function () {
@@ -390,6 +510,9 @@
   pitchEl.addEventListener("mousedown", function (e) {
     const { x, y } = clientToPitch(e.clientX, e.clientY);
     const player = getPlayerAt(x, y);
+    if (!player && state.profilePopoverPlayerId) {
+      hideProfilePopover();
+    }
     if (!player) return;
     e.preventDefault();
     state.drag = {
@@ -421,8 +544,11 @@
     const movedEnough = Math.hypot(dx, dy) > 4;
     if (!movedEnough) {
       setBallOwner(drag.player.id);
+      showProfilePopover(drag.player);
     } else {
       requestEpvUpdate();
     }
   });
+
+  setupProfilePopoverListeners();
 })();

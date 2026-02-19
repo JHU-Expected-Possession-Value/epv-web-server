@@ -275,7 +275,7 @@ class EPVCalculator:
         frame_data = tracking_dict.get(frame, {})
 
         # Evaluate each action
-        q_shoot = self.evaluate_shoot(x, y, frame, frame_data, player_id, team_id)
+        q_shoot, _ = self.evaluate_shoot(x, y, frame, frame_data, player_id, team_id)
         q_pass = self.evaluate_best_pass(x, y, frame, frame_data, player_id, team_id, tracking_dict, depth)
         q_dribble = self.evaluate_best_dribble(x, y, frame, frame_data, player_id, team_id, tracking_dict, depth)
 
@@ -287,6 +287,98 @@ class EPVCalculator:
 
         return epv
 
+    def _point_to_segment_distance(
+        self,
+        px: float, py: float,
+        x1: float, y1: float,
+        x2: float, y2: float
+    ) -> float:
+        """Compute distance from point (px, py) to line segment (x1,y1)-(x2,y2)."""
+        dx = x2 - x1
+        dy = y2 - y1
+        if dx == 0 and dy == 0:
+            return np.sqrt((px - x1)**2 + (py - y1)**2)
+        t = max(0.0, min(1.0, ((px - x1) * dx + (py - y1) * dy) / (dx * dx + dy * dy)))
+        proj_x = x1 + t * dx
+        proj_y = y1 + t * dy
+        return np.sqrt((px - proj_x)**2 + (py - proj_y)**2)
+
+    def _sigmoid(self, x: float, center: float = 0.0, steepness: float = 1.0) -> float:
+        """Smooth sigmoid function: 1 / (1 + exp(-steepness * (x - center)))."""
+        return 1.0 / (1.0 + np.exp(-steepness * (x - center)))
+
+    def _get_skills_for_player(self, frame_data: Dict, player_id: int) -> Tuple[float, float, float]:
+        """Return (finishing, passing, dribbling) in [0,1] from frame_data skill_multipliers. Default 0.5 if missing."""
+        if not frame_data or "player_data" not in frame_data:
+            return (0.5, 0.5, 0.5)
+        for p in frame_data["player_data"]:
+            if p.get("player_id") == player_id:
+                sm = p.get("skill_multipliers") or {}
+                return (
+                    float(sm.get("finishing", 0.5)),
+                    float(sm.get("passing", 0.5)),
+                    float(sm.get("dribbling", 0.5)),
+                )
+        return (0.5, 0.5, 0.5)
+
+    def _pass_lane_and_receiver_defender_distances(
+        self,
+        x_origin: float,
+        y_origin: float,
+        x_dest: float,
+        y_dest: float,
+        frame_data: Dict,
+        team_id: int,
+        default_lane: float = 50.0,
+        default_recv: float = 50.0
+    ) -> Tuple[float, float]:
+        """
+        Min defender distance to pass segment and min defender distance to receiver.
+        All coordinates must be in the same system (center-based: origin, dest, and
+        frame_data['player_data'] x,y are all center coords).
+        Returns (lane_min_def_dist, recv_min_def_dist).
+        """
+        if not frame_data or "player_data" not in frame_data or not self.current_team_roster:
+            return (default_lane, default_recv)
+        opponent_team_ids = [tid for tid in self.current_team_roster.keys() if tid != team_id]
+        if not opponent_team_ids:
+            return (default_lane, default_recv)
+        opponent_players = set()
+        for opp_team_id in opponent_team_ids:
+            opponent_players.update(self.current_team_roster[opp_team_id])
+        lane_min = None
+        recv_min = None
+        for player in frame_data.get("player_data", []):
+            if not player.get("is_detected", False) or player["player_id"] not in opponent_players:
+                continue
+            px, py = player["x"], player["y"]
+            d_lane = self._point_to_segment_distance(px, py, x_origin, y_origin, x_dest, y_dest)
+            d_recv = np.sqrt((px - x_dest) ** 2 + (py - y_dest) ** 2)
+            if lane_min is None or d_lane < lane_min:
+                lane_min = d_lane
+            if recv_min is None or d_recv < recv_min:
+                recv_min = d_recv
+        return (
+            float(lane_min) if lane_min is not None else default_lane,
+            float(recv_min) if recv_min is not None else default_recv,
+        )
+
+    def _pass_risk_from_distances(
+        self,
+        lane_min_def_dist: float,
+        recv_min_def_dist: float,
+        sigma_lane: float = 1.25,
+        sigma_recv: float = 2.0
+    ) -> float:
+        """
+        Convert lane and receiver defender distances to a [0,1] risk.
+        risk = clamp(0.7 * lane_risk + 0.3 * receiver_pressure), where each term
+        is exp(-(d**2)/(2*sigma**2)) so small distance -> high risk.
+        """
+        lane_risk = np.exp(-(lane_min_def_dist ** 2) / (2.0 * sigma_lane ** 2))
+        recv_pressure = np.exp(-(recv_min_def_dist ** 2) / (2.0 * sigma_recv ** 2))
+        return float(np.clip(0.7 * lane_risk + 0.3 * recv_pressure, 0.0, 1.0))
+
     def evaluate_shoot(
         self,
         x: float,
@@ -295,17 +387,22 @@ class EPVCalculator:
         frame_data: Dict,
         player_id: int,
         team_id: int
-    ) -> float:
+    ) -> tuple[float, Dict]:
         """
-        Evaluate shooting action using xG model.
+        Evaluate shooting action using xG model with defender-aware pressure multiplier.
 
         Returns:
-            Expected goals from shooting at this location
+            Tuple of (q_shoot, explain_dict) where explain_dict contains:
+            - base_xg: raw model output
+            - shot_min_def_dist: minimum distance to any defender
+            - shot_blocked: True if defender blocks shot line
+            - shot_pressure_multiplier: applied multiplier
         """
         goal_x = self._resolve_goal_x(team_id, frame_data)
+        goal_y = self.goal_y
 
         # Calculate shooting features
-        distance_to_goal = np.sqrt((x - goal_x)**2 + (y - self.goal_y)**2)
+        distance_to_goal = np.sqrt((x - goal_x)**2 + (y - goal_y)**2)
         ang1 = np.degrees(np.arctan2(3.66 - y, goal_x - x))
         ang2 = np.degrees(np.arctan2(-3.66 - y, goal_x - x))
         angle_to_goal = abs(ang2 - ang1)
@@ -365,13 +462,84 @@ class EPVCalculator:
         else:
             features = pd.DataFrame([feature_dict]).values
 
-        # Predict xG
+        # Predict base xG
+        base_xg = 0.0
         try:
-            xg = self.xg_model.predict_proba(features)[0, 1]
-            return float(xg)
+            base_xg = float(self.xg_model.predict_proba(features)[0, 1])
         except Exception as e:
             print(f"  ⚠️  xG prediction error: {e}")
-            return 0.0
+            return (0.0, {
+                "base_xg": 0.0,
+                "shot_min_def_dist": float('inf'),
+                "shot_blocked": False,
+                "shot_pressure_multiplier": 1.0
+            })
+
+        # Defender-aware pressure computation
+        shot_min_def_dist = float('inf')
+        shot_blocked = False
+        block_radius = 1.5
+
+        if frame_data and 'player_data' in frame_data and self.current_team_roster:
+            opponent_team_ids = [tid for tid in self.current_team_roster.keys() if tid != team_id]
+            opponent_players = set()
+            for opp_team_id in opponent_team_ids:
+                opponent_players.update(self.current_team_roster[opp_team_id])
+
+            for player in frame_data.get('player_data', []):
+                if not player.get('is_detected', False):
+                    continue
+                if player['player_id'] not in opponent_players:
+                    continue
+
+                px = player['x']
+                py = player['y']
+
+                # Compute distance to shooter
+                dist_to_shooter = np.sqrt((px - x)**2 + (py - y)**2)
+                if dist_to_shooter < shot_min_def_dist:
+                    shot_min_def_dist = dist_to_shooter
+
+                # Check if defender blocks shot line (point-to-segment distance)
+                # Only count if defender is between shooter and goal
+                if goal_x > x:
+                    between = x <= px <= goal_x
+                else:
+                    between = goal_x <= px <= x
+
+                if between:
+                    dist_to_line = self._point_to_segment_distance(px, py, x, y, goal_x, goal_y)
+                    if dist_to_line <= block_radius:
+                        shot_blocked = True
+
+        if shot_min_def_dist == float('inf'):
+            shot_min_def_dist = 100.0  # No defenders found
+
+        # Compute shot_pressure_multiplier using sigmoid
+        # Multiplier decreases as defenders get closer
+        # Steeper decrease if shot is blocked
+        base_multiplier = self._sigmoid(shot_min_def_dist - 3.0, center=0.0, steepness=0.8)
+        if shot_blocked:
+            blocked_penalty = 0.3
+        else:
+            blocked_penalty = 0.0
+        shot_pressure_multiplier = max(0.1, base_multiplier - blocked_penalty)
+
+        q_shoot = base_xg * shot_pressure_multiplier
+        finishing_skill = self._get_skills_for_player(frame_data, player_id)[0]
+        mult_finish = 0.85 + 0.30 * finishing_skill
+        q_shoot *= mult_finish
+        q_shoot = float(np.clip(q_shoot, 0.0, 1.0))
+
+        explain = {
+            "base_xg": float(base_xg),
+            "shot_min_def_dist": float(shot_min_def_dist),
+            "shot_blocked": bool(shot_blocked),
+            "shot_pressure_multiplier": float(shot_pressure_multiplier),
+            "mult_finish": float(mult_finish),
+        }
+
+        return (float(q_shoot), explain)
 
     def evaluate_best_pass(
         self,
@@ -383,40 +551,110 @@ class EPVCalculator:
         team_id: int,
         tracking_dict: Dict,
         depth: int,
-        return_dest: bool = False
+        return_dest: bool = False,
+        return_explain: bool = False
     ):
         """
-        Evaluate best pass action.
-
-        Iterates over all detected teammate positions and returns highest Q-value.
-
-        Returns:
-            Expected goals from best pass
+        Evaluate best pass with defender-aware risk (lane + receiver pressure).
+        All coordinates (x, y, dest_*, frame_data positions) are in the same
+        center-based system used by _point_to_segment_distance.
+        adjusted = base * (1 - risk). Safety override: if any candidate has
+        risk <= 0.25 and adjusted >= 90% of best adjusted, choose the safest
+        (lowest risk) among those; else choose best adjusted.
         """
-        best_q = 0.0
+        best_q_adj = 0.0
         best_dest = None
+        best_base = 0.0
+        best_risk = 0.0
+        candidates: List[Dict] = []
 
-        # Evaluate all actual teammate positions
         destinations = self._get_teammate_positions(frame_data, team_id, player_id)
         if not destinations:
-            return (best_q, best_dest) if return_dest else best_q
+            if return_explain:
+                return (0.0, {
+                    "best_pass_target": None,
+                    "best_pass_risk": 0.0,
+                    "best_pass_base": 0.0,
+                    "best_pass_adjusted": 0.0,
+                    "top_candidates": [],
+                })
+            return (0.0, best_dest) if return_dest else 0.0
 
-        for dest_x, dest_y in destinations:
-            # Check if destination is valid
+        for receiver_id, dest_x, dest_y in destinations:
             if not self._is_valid_location(dest_x, dest_y):
                 continue
-
-            q = self.evaluate_single_pass(
+            q_base = self.evaluate_single_pass(
                 x, y, dest_x, dest_y,
                 frame, frame_data, player_id, team_id,
                 tracking_dict, depth
             )
+            lane_min_def_dist, recv_min_def_dist = self._pass_lane_and_receiver_defender_distances(
+                x, y, dest_x, dest_y, frame_data, team_id
+            )
+            risk = self._pass_risk_from_distances(lane_min_def_dist, recv_min_def_dist)
+            q_adj = q_base * (1.0 - risk)
+            candidates.append({
+                "receiver_id": receiver_id,
+                "receiver_xy": (float(dest_x), float(dest_y)),
+                "base": float(q_base),
+                "lane_min_def_dist": float(lane_min_def_dist),
+                "recv_min_def_dist": float(recv_min_def_dist),
+                "risk": float(risk),
+                "adjusted": float(q_adj),
+            })
 
-            if q > best_q:
-                best_q = q
-                best_dest = (dest_x, dest_y)
+        if not candidates:
+            if return_explain:
+                return (0.0, {
+                    "best_pass_target": None,
+                    "best_pass_risk": 0.0,
+                    "best_pass_base": 0.0,
+                    "best_pass_adjusted": 0.0,
+                    "top_candidates": [],
+                })
+            return (0.0, best_dest) if return_dest else 0.0
 
-        return (best_q, best_dest) if return_dest else best_q
+        best_adj = max(c["adjusted"] for c in candidates)
+        safe = [c for c in candidates if c["risk"] <= 0.25 and c["adjusted"] >= 0.9 * best_adj]
+        if safe:
+            chosen = min(safe, key=lambda c: c["risk"])
+        else:
+            chosen = max(candidates, key=lambda c: c["adjusted"])
+        best_q_adj = chosen["adjusted"]
+        best_dest = chosen["receiver_xy"]
+        best_base = chosen["base"]
+        best_risk = chosen["risk"]
+
+        passing_skill = self._get_skills_for_player(frame_data, player_id)[1]
+        mult_pass = 0.85 + 0.30 * passing_skill
+        best_q_adj = float(np.clip(best_q_adj * mult_pass, 0.0, 1.0))
+
+        if return_explain:
+            candidates.sort(key=lambda c: c["adjusted"], reverse=True)
+            top_candidates = candidates[:10]
+            explain = {
+                "best_pass_target": {"x": best_dest[0], "y": best_dest[1]} if best_dest else None,
+                "best_pass_risk": float(best_risk),
+                "best_pass_base": float(best_base),
+                "best_pass_adjusted": float(best_q_adj),
+                "mult_pass": float(mult_pass),
+                "top_candidates": [
+                    {
+                        "receiver_id": c["receiver_id"],
+                        "receiver_xy": c["receiver_xy"],
+                        "base": c["base"],
+                        "lane_min_def_dist": c["lane_min_def_dist"],
+                        "recv_min_def_dist": c["recv_min_def_dist"],
+                        "risk": c["risk"],
+                        "adjusted": c["adjusted"],
+                    }
+                    for c in top_candidates
+                ],
+            }
+            return (best_q_adj, explain)
+        if return_dest:
+            return (best_q_adj, (best_dest[0], best_dest[1]))
+        return best_q_adj
 
     def evaluate_single_pass(
         self,
@@ -540,75 +778,98 @@ class EPVCalculator:
         player_id: int,
         team_id: int,
         tracking_dict: Dict,
-        depth: int
-    ) -> float:
+        depth: int,
+        return_explain: bool = False
+    ):
         """
-        Evaluate best dribble action.
-
-        Samples several dribble destinations and returns highest Q-value.
-
-        Returns:
-            Expected goals from best dribble
+        Evaluate best dribble with defender-aware pressure multiplier.
+        Uses theta (facing direction) for open-space check. Returns float or
+        (q_dribble, explain_dict) when return_explain=True.
         """
+        theta = 0.0
+        if frame_data and "player_data" in frame_data:
+            for p in frame_data["player_data"]:
+                if p.get("player_id") == player_id:
+                    theta = float(p.get("theta", 0.0))
+                    break
+
+        dribble_min_def_dist = self._dribble_min_defender_distance(
+            x, y, frame_data, team_id, default=50.0
+        )
+        dribble_nearby_defenders = self._count_defenders_within_distance(
+            x, y, frame_data, team_id, distance=5.0
+        )
+        dribble_open_space_m = self._dribble_open_space_m(
+            x, y, theta, frame_data, team_id,
+            sample_distances=[2.0, 4.0, 6.0, 8.0, 10.0, 12.0],
+            safe_dist=1.5
+        )
+
+        m = 1.0
+        m *= self._sigmoid(dribble_min_def_dist - 3.0, center=0.0, steepness=1.0)
+        m *= 1.0 / (1.0 + 0.25 * dribble_nearby_defenders)
+        m *= float(np.clip(0.6 + 0.05 * dribble_open_space_m, 0.6, 1.2))
+        dribble_pressure_multiplier = float(np.clip(m, 0.1, 1.5))
+
         best_q = 0.0
-
-        # Sample dribble destinations (forward, diagonal)
         destinations = self._sample_dribble_destinations(x, y)
-
         for dest_x, dest_y in destinations:
-            # Check if destination is valid
             if not self._is_valid_location(dest_x, dest_y):
                 continue
-
             distance = np.sqrt((dest_x - x)**2 + (dest_y - y)**2)
-            if distance < 1.0:  # Too short
+            if distance < 1.0:
                 continue
-
-            # Use actual dribbling model if available
             if self.dribbling_model and self.dribbling_model.is_trained:
                 p_success = self._evaluate_dribble_with_model(
                     x, y, dest_x, dest_y, frame, frame_data, player_id, team_id
                 )
             else:
-                # Fallback heuristic
                 p_success = 0.7 if distance < 5 else 0.5
-
-            # Value if successful (RECURSIVE)
             v_success = self.get_epv(
                 dest_x, dest_y, frame + 20, player_id, team_id,
                 tracking_dict, depth + 1
             )
-
-            # Value if failed
-            v_fail = -0.08  # Higher risk than pass
-
+            v_fail = -0.08
             q = p_success * v_success + (1 - p_success) * v_fail
             best_q = max(best_q, q)
 
-        return best_q
+        base_dribble_value = best_q
+        q_dribble = base_dribble_value * dribble_pressure_multiplier
+        dribbling_skill = self._get_skills_for_player(frame_data, player_id)[2]
+        mult_dribble = 0.85 + 0.30 * dribbling_skill
+        q_dribble *= mult_dribble
+        q_dribble = float(np.clip(q_dribble, 0.0, 1.0))
+
+        if return_explain:
+            explain = {
+                "base_dribble": float(base_dribble_value),
+                "dribble_min_def_dist": float(dribble_min_def_dist),
+                "dribble_nearby_defenders": int(dribble_nearby_defenders),
+                "dribble_open_space_m": float(dribble_open_space_m),
+                "dribble_pressure_multiplier": float(dribble_pressure_multiplier),
+                "mult_dribble": float(mult_dribble),
+            }
+            return (q_dribble, explain)
+        return q_dribble
 
     def _get_teammate_positions(
         self,
         frame_data: Dict,
         team_id: int,
         player_id: int
-    ) -> List[Tuple[float, float]]:
-        """Get actual positions of teammates from tracking data."""
-        teammates = []
+    ) -> List[Tuple[int, float, float]]:
+        """Get actual positions of teammates from tracking data. Returns (receiver_id, x, y)."""
+        teammates: List[Tuple[int, float, float]] = []
 
-        if 'player_data' not in frame_data:
+        if "player_data" not in frame_data:
             return teammates
 
-        # Get team roster
         team_roster = self.current_team_roster.get(team_id, set())
-
-        for player in frame_data['player_data']:
-            # Skip if not on same team or is the current player
-            if player['player_id'] not in team_roster or player['player_id'] == player_id:
+        for player in frame_data["player_data"]:
+            pid = player["player_id"]
+            if pid not in team_roster or pid == player_id:
                 continue
-
-            teammates.append((player['x'], player['y']))
-
+            teammates.append((pid, player["x"], player["y"]))
         return teammates
 
     def _calculate_defensive_line(
@@ -810,6 +1071,81 @@ class EPVCalculator:
                 count += 1
 
         return count
+
+    def _dribble_min_defender_distance(
+        self,
+        x: float,
+        y: float,
+        frame_data: Dict,
+        team_id: int,
+        default: float = 50.0
+    ) -> float:
+        """Min Euclidean distance from (x, y) to any defender."""
+        if not frame_data or "player_data" not in frame_data or not self.current_team_roster:
+            return default
+        opponent_team_ids = [tid for tid in self.current_team_roster.keys() if tid != team_id]
+        if not opponent_team_ids:
+            return default
+        opponent_players = set()
+        for opp_team_id in opponent_team_ids:
+            opponent_players.update(self.current_team_roster[opp_team_id])
+        min_dist = None
+        for player in frame_data.get("player_data", []):
+            if not player.get("is_detected", False) or player["player_id"] not in opponent_players:
+                continue
+            px, py = player["x"], player["y"]
+            d = np.sqrt((x - px) ** 2 + (y - py) ** 2)
+            if min_dist is None or d < min_dist:
+                min_dist = d
+        return float(min_dist) if min_dist is not None else default
+
+    def _dribble_open_space_m(
+        self,
+        x: float,
+        y: float,
+        theta: float,
+        frame_data: Dict,
+        team_id: int,
+        sample_distances: Optional[List[float]] = None,
+        safe_dist: float = 1.5
+    ) -> float:
+        """
+        Farthest sampled distance along ray (x,y) + t*(cos(theta), sin(theta))
+        that is in bounds and >= safe_dist from every defender.
+        theta in radians. Returns 0 if no point is open.
+        """
+        if sample_distances is None:
+            sample_distances = [2.0, 4.0, 6.0, 8.0, 10.0, 12.0]
+        dx = np.cos(theta)
+        dy = np.sin(theta)
+        opponent_players = set()
+        if frame_data and "player_data" in frame_data and self.current_team_roster:
+            for tid in self.current_team_roster:
+                if tid != team_id:
+                    opponent_players.update(self.current_team_roster[tid])
+        defender_positions = []
+        if frame_data and "player_data" in frame_data:
+            for player in frame_data["player_data"]:
+                if player.get("is_detected", False) and player["player_id"] in opponent_players:
+                    defender_positions.append((player["x"], player["y"]))
+        open_farthest = 0.0
+        for d in sample_distances:
+            px = x + d * dx
+            py = y + d * dy
+            if not self._is_valid_location(px, py):
+                break
+            if not defender_positions:
+                open_farthest = d
+                continue
+            min_def = min(
+                np.sqrt((px - ox) ** 2 + (py - oy) ** 2)
+                for ox, oy in defender_positions
+            )
+            if min_def >= safe_dist:
+                open_farthest = d
+            else:
+                break
+        return open_farthest
 
     def _count_defenders_in_passing_lane(
         self,
@@ -1088,29 +1424,152 @@ class EPVCalculator:
         frame_data = tracking_dict.get(frame, {})
 
         # Evaluate each action
-        q_shoot = self.evaluate_shoot(x, y, frame, frame_data, player_id, team_id)
-        q_pass = self.evaluate_best_pass(x, y, frame, frame_data, player_id, team_id, tracking_dict, depth=0)
-        q_dribble = self.evaluate_best_dribble(x, y, frame, frame_data, player_id, team_id, tracking_dict, depth=0)
+        q_shoot, shoot_explain = self.evaluate_shoot(x, y, frame, frame_data, player_id, team_id)
+        q_pass, pass_explain = self.evaluate_best_pass(
+            x, y, frame, frame_data, player_id, team_id, tracking_dict, depth=0, return_explain=True
+        )
+        q_dribble, dribble_explain = self.evaluate_best_dribble(
+            x, y, frame, frame_data, player_id, team_id, tracking_dict, depth=0, return_explain=True
+        )
 
-        # Determine best action
-        q_values = {
-            'shoot': q_shoot,
-            'pass': q_pass,
-            'dribble': q_dribble
+        # --- Individuality: multipliers already applied at source (evaluate_shoot/pass/dribble). Build explain only. ---
+        finishing_skill, passing_skill, dribbling_skill = self._get_skills_for_player(frame_data, player_id)
+        mult_finish = 0.85 + 0.30 * finishing_skill
+        mult_pass = 0.85 + 0.30 * passing_skill
+        mult_dribble = 0.85 + 0.30 * dribbling_skill
+        profile_explain = {
+            "finishing": float(finishing_skill),
+            "passing": float(passing_skill),
+            "dribbling": float(dribbling_skill),
+            "mult_finish": float(mult_finish),
+            "mult_pass": float(mult_pass),
+            "mult_dribble": float(mult_dribble),
+            "applied_multipliers": {"shoot": mult_finish, "pass": mult_pass, "dribble": mult_dribble},
         }
+        q_shoot = float(np.clip(q_shoot, 0.0, 1.0))
+        q_pass = float(np.clip(q_pass, 0.0, 1.0))
+        q_dribble = float(np.clip(q_dribble, 0.0, 1.0))
 
-        best_action = max(q_values, key=q_values.get)
-        epv = q_values[best_action]
+        # --- Contextual policy (center coords throughout) ---
+        goal_x = self._resolve_goal_x(team_id, frame_data)
+        goal_y = self.goal_y
 
-        return {
-            'action': best_action,
-            'epv': epv,
-            'q_shoot': q_shoot,
-            'q_pass': q_pass,
-            'q_dribble': q_dribble,
-            'location': (x, y),
-            'details': {
-                'player_id': player_id,
-                'frame': frame,
-            }
+        # Shoot rule: strict penalty so shooting almost never wins when blocked or high pressure
+        shot_blocked = shoot_explain.get("shot_blocked", False)
+        shot_pressure = shoot_explain.get("shot_pressure_multiplier", 1.0)
+        base_xg = shoot_explain.get("base_xg", 0.0)
+        if shot_blocked:
+            q_shoot_eff = q_shoot * 0.05
+            shoot_reason = "shot blocked"
+        elif shot_pressure < 0.45:
+            q_shoot_eff = q_shoot * 0.2
+            shoot_reason = "high pressure"
+        else:
+            q_shoot_eff = q_shoot
+            if base_xg > 0.2 and shot_pressure >= 0.6:
+                q_shoot_eff = q_shoot + 0.02
+                shoot_reason = "high-xG region, low pressure (prefer shoot)"
+            else:
+                shoot_reason = "shoot"
+
+        # Pass rule: short safe pass sanity
+        pass_candidates = pass_explain.get("top_candidates") or []
+        best_overall_adjusted = pass_explain.get("best_pass_adjusted", 0.0)
+        best_overall_target = pass_explain.get("best_pass_target")
+        passer_xy = (x, y)
+        short_safe = []
+        for c in pass_candidates:
+            rx, ry = c["receiver_xy"][0], c["receiver_xy"][1]
+            dist = np.sqrt((rx - x) ** 2 + (ry - y) ** 2)
+            if dist <= 12.0 and c.get("risk", 1.0) <= 0.25:
+                short_safe.append((c["adjusted"], (rx, ry), c))
+        chosen_pass_receiver_id = None
+        chosen_pass_risk = None
+        if short_safe:
+            best_short_safe_adj = max(s[0] for s in short_safe)
+            best_short_safe = max(short_safe, key=lambda s: s[0])
+            if best_overall_adjusted <= best_short_safe_adj + 0.03:
+                q_pass_eff = best_short_safe_adj
+                chosen_pass_target = best_short_safe[1]
+                chosen_pass_receiver_id = best_short_safe[2].get("receiver_id")
+                chosen_pass_risk = best_short_safe[2].get("risk")
+                pass_reason = "short safe pass (within 12m, risk<=0.25)"
+            else:
+                q_pass_eff = best_overall_adjusted
+                chosen_pass_target = (best_overall_target["x"], best_overall_target["y"]) if best_overall_target else None
+                pass_reason = "best adjusted pass"
+                if pass_candidates:
+                    chosen_pass_receiver_id = pass_candidates[0].get("receiver_id")
+                    chosen_pass_risk = pass_explain.get("best_pass_risk")
+        else:
+            q_pass_eff = best_overall_adjusted
+            chosen_pass_target = (best_overall_target["x"], best_overall_target["y"]) if best_overall_target else None
+            pass_reason = "best adjusted pass"
+            if pass_candidates:
+                chosen_pass_receiver_id = pass_candidates[0].get("receiver_id")
+                chosen_pass_risk = pass_explain.get("best_pass_risk")
+
+        # Dribble rule: allow to beat pass when open space and low pressure
+        dribble_open = dribble_explain.get("dribble_open_space_m", 0.0)
+        dribble_mult = dribble_explain.get("dribble_pressure_multiplier", 0.0)
+        if dribble_open >= 8.0 and dribble_mult >= 0.9 and q_dribble >= (q_pass_eff - 0.01):
+            q_dribble_eff = max(q_dribble, q_pass_eff + 0.005)
+            dribble_reason = "open space and low pressure (dribble preferred when close to pass)"
+        else:
+            q_dribble_eff = q_dribble
+            dribble_reason = "dribble"
+
+        # Choose best action
+        q_values_eff = {"shoot": q_shoot_eff, "pass": q_pass_eff, "dribble": q_dribble_eff}
+        best_action = max(q_values_eff, key=q_values_eff.get)
+        epv = q_values_eff[best_action]
+
+        # Reasons and raw q for reporting
+        reasons = {"shoot": shoot_reason, "pass": pass_reason, "dribble": dribble_reason}
+        best_action_reason = reasons[best_action]
+
+        # Single authoritative best_action_target (center coords), same goal as evaluate_shoot for shoot
+        half_len = self.pitch_length / 2
+        half_w = self.pitch_width / 2
+        if best_action == "shoot":
+            best_action_target = (goal_x, goal_y)
+        elif best_action == "pass":
+            best_action_target = chosen_pass_target if chosen_pass_target is not None else (x, y)
+        elif best_action == "dribble":
+            theta = 0.0
+            if frame_data and "player_data" in frame_data:
+                for p in frame_data["player_data"]:
+                    if p.get("player_id") == player_id:
+                        theta = float(p.get("theta", 0.0))
+                        break
+            open_m = dribble_open if dribble_open is not None else 0.0
+            d = min(10.0, open_m) if open_m > 0 else 3.0
+            tx = x + d * np.cos(theta)
+            ty = y + d * np.sin(theta)
+            tx = float(np.clip(tx, -half_len, half_len))
+            ty = float(np.clip(ty, -half_w, half_w))
+            best_action_target = (tx, ty)
+        else:
+            best_action_target = (goal_x, goal_y)
+
+        out = {
+            "action": best_action,
+            "epv": epv,
+            "q_shoot": q_shoot,
+            "q_pass": q_pass,
+            "q_dribble": q_dribble,
+            "best_action_reason": best_action_reason,
+            "best_action_target": {"x": best_action_target[0], "y": best_action_target[1]},
+            "location": (x, y),
+            "details": {"player_id": player_id, "frame": frame},
+            "explain": {
+                "shoot": shoot_explain,
+                "pass": pass_explain,
+                "dribble": dribble_explain,
+                "profile": profile_explain,
+            },
         }
+        if best_action == "pass":
+            out["chosen_pass_receiver_id"] = chosen_pass_receiver_id
+            out["chosen_pass_risk"] = chosen_pass_risk
+        return out

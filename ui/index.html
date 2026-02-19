@@ -16,6 +16,10 @@
     <section class="pitch-section">
       <h2>Pitch (105 × 68)</h2>
       <div class="pitch-wrap">
+        <div id="profile-popover" class="profile-popover hidden">
+          <label class="profile-popover-label">Player Profile</label>
+          <select id="per-player-profile" class="profile-popover-select"></select>
+        </div>
         <svg id="pitch" class="pitch" viewBox="0 0 105 68" preserveAspectRatio="xMidYMid meet">
           <defs>
             <linearGradient id="grass" x1="0%" y1="0%" x2="0%" y2="100%">
@@ -69,9 +73,6 @@
         <label for="ball-owner-profile">Ball Owner Profile</label>
         <select id="ball-owner-profile">
           <option value="average">Average</option>
-          <option value="elite_passer">Elite passer</option>
-          <option value="elite_finisher">Elite finisher</option>
-          <option value="elite_dribbler">Elite dribbler</option>
         </select>
       </div>
       <p id="epv-status" class="epv-status hidden">Updating…</p>
@@ -81,6 +82,9 @@
         <p>Q shoot: <span id="q-shoot">—</span></p>
         <p>Q pass: <span id="q-pass">—</span></p>
         <p>Q dribble: <span id="q-dribble">—</span></p>
+        <p class="epv-reason">Reason: <span id="best-action-reason">—</span></p>
+        <div id="epv-action-detail" class="epv-action-detail"></div>
+        <p id="epv-profile-info" class="epv-profile-info"></p>
       </div>
     </section>
   </div>
