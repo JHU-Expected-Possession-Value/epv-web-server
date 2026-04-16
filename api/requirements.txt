@@ -5,3 +5,8 @@ pandas
 pytest
 httpx
 python-dotenv
+SQLAlchemy
+psycopg2-binary
+Pillow
+opencv-python-headless
+ultralytics

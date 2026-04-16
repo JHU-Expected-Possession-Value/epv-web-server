@@ -38,12 +38,15 @@ wheels/
 
 # Environment
 .env
-.venv
+.venv/
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Tool-generated folders
+_pydeps/
 
 # IDEs
 .vscode/

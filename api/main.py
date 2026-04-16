@@ -1,3 +1,23 @@
+"""FastAPI backend entrypoint.
+
+**PostgreSQL (AWS RDS) at runtime** — request-scoped sessions via `api.db.get_db`:
+- **Replay router** (`/replay/*`): `matches`, `teams`, `events`, `frame`, `detection`
+  (see `api/routers/replay.py`, `api/services/replay_service.py`).
+- **This file**: `/api/tactics/teams`, `/api/tactics/players`, `/api/tactics/roster`,
+  `/api/tactics/player-action-heatmap` → `teams`, `players`, `shots`, `passes`, `carries`, `goals`.
+- **`POST /replay/recommend`**: single-frame read from `frame`/`detection` + EPV models.
+
+**Not from RDS (by design):**
+- **`POST /api/epv`**, **`POST /api/tactics/recommendation`**: EPV **`.pkl`** under `epv-web-server/models/`
+  plus optional skill **CSVs** under `epv-web-server/data/` (player individuality).
+- **`POST /api/cv/*`**: uploaded images + YOLO weights on the server.
+
+**Local files:** `api/utils/paths.py` (`EPV_DATA_DIR`) is **not** used for website routes; ingestion
+uses `fillTables.py` into RDS instead.
+
+Database querying belongs in `api/services/*` where possible; this file mounts routers and tactics.
+"""
+
 import math
 import os
 import sys
@@ -5,25 +25,28 @@ from pathlib import Path
 from typing import List, Literal, Optional, Union
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+
+# epv-web-server/.env must be loaded before `api.db` is imported: importing `api.db` runs
+# `SessionLocal = get_sessionmaker()` which calls `get_engine()` and reads DATABASE_URL / PG*.
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_BACKEND_ROOT / ".env")
+
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import MetaData, Table, and_, select, text
+from sqlalchemy.orm import Session
 
-# Load environment variables from .env file
-load_dotenv()
+from api.db import get_db
+from api.services import replay_service
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = REPO_ROOT / "src"
 MODELS_DIR = REPO_ROOT / "models"
 
-# Read EPV_DATA_DIR from environment (required)
-EPV_DATA_DIR = os.getenv("EPV_DATA_DIR")
-if not EPV_DATA_DIR:
-    raise RuntimeError(
-        "EPV_DATA_DIR environment variable must be set. "
-        "Please set it in your .env file or environment."
-    )
-DATA_DIR = Path(EPV_DATA_DIR)
+# Local packaged data directory (player skill CSVs).
+# This keeps the deployed backend independent of a developer machine path like EPV_DATA_DIR.
+DATA_DIR = REPO_ROOT / "data"
 
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
@@ -46,8 +69,24 @@ app = FastAPI()
 
 # Mount routers
 from api.routers import replay
+from api.routers import cv
 
 app.include_router(replay.router, prefix="/replay", tags=["replay"])
+app.include_router(cv.router, prefix="/api/cv", tags=["cv"])
+
+# SQLAlchemy table reflection cache for simple read-only queries.
+_metadata = MetaData()
+
+
+def _table(db: Session, name: str) -> Table:
+    return Table(name, _metadata, autoload_with=db.get_bind())
+
+
+def _first_col(t: Table, *names: str):
+    for n in names:
+        if n in t.c:
+            return t.c[n]
+    return None
 
 # --- Player profile registry (from skill CSVs), keyed by profile_id (string), cached at startup ---
 _player_registry: Optional[List[dict]] = None
@@ -367,7 +406,19 @@ def _profile_by_id(profile_id: Union[str, int]) -> Optional[dict]:
 
 
 def build_frame_data_and_roster(payload: EPVRequest) -> tuple[dict, dict]:
-    """Build tracking frame_data and current_team_roster from request payload. Injects skill_multipliers from profile_id or request."""
+    """Build tracking `frame_data` and `current_team_roster` from request payload.
+
+    Coordinate transformation (source of truth for the whole web stack):
+    - Tactical board UI uses centered meters: x∈[-52.5, 52.5], y∈[-34, 34]
+    - EPVRequest (API schema) uses pitch coords: x∈[0, 105], y∈[0, 68]
+    - EPVCalculator consumes centered meters again (its historical convention)
+    So we always convert request x/y (API pitch coords) -> centered meters here.
+
+    Attacker/defender identification:
+    - `payload.possessionTeam` ("home"|"away") determines the attacking team
+    - `current_team_roster` maps team_id -> set[player_id] and is used to split
+      teammates vs opponents when computing defender distances / lane pressure.
+    """
     roster: dict[int, set[int]] = {1: set(), 2: set()}
     player_data = []
     ball_x, ball_y = 0.0, 0.0
@@ -619,30 +670,33 @@ def placeholder_epv(payload: EPVRequest) -> EPVResponse:
 
 
 def apply_profile_to_response(raw: EPVResponse, payload: EPVRequest) -> EPVResponse:
-    """Apply ball-owner profile multipliers to q-values and recompute best_action and epv."""
+    """Apply ball-owner profile multipliers to q-values for *display*.
+
+    Important: this must NOT re-decide the best action.
+    The EPVCalculator already chooses `best_action` using spatial context and
+    policy rules (shot pressure/blocks, safe pass override, dribble open space).
+    Recomputing `best_action = argmax(q_*)` here can create unrealistic "shoot"
+    recommendations by ignoring those contextual rules.
+    """
     profile = getattr(payload, "ballOwnerProfile", "average") or "average"
     mult = PROFILE_MULTIPLIERS.get(profile, (1.0, 1.0, 1.0))
     ms, mp, md = mult
     q_shoot = raw.q_shoot * ms
     q_pass = raw.q_pass * mp
     q_dribble = raw.q_dribble * md
-    q_values = [("shoot", q_shoot), ("pass", q_pass), ("dribble", q_dribble)]
-    best_action_name = max(q_values, key=lambda t: t[1])[0]
-    epv = max(q_shoot, q_pass, q_dribble)
-    best_pass_target = None
-    pass_candidates = None
-    if best_action_name == "pass":
-        best_pass_target, pass_candidates = _compute_best_pass_heuristic(payload)
+    # Preserve the calculator's coherent decision bundle.
+    best_action_name = raw.best_action
+    epv = raw.epv
     return EPVResponse(
-        epv=round(epv, 4),
+        epv=round(float(epv), 4),
         best_action=best_action_name,
         q_shoot=round(q_shoot, 4),
         q_pass=round(q_pass, 4),
         q_dribble=round(q_dribble, 4),
         best_action_reason=raw.best_action_reason,
         best_action_target=raw.best_action_target,
-        best_pass_target=best_pass_target,
-        pass_candidates=pass_candidates,
+        best_pass_target=raw.best_pass_target,
+        pass_candidates=raw.pass_candidates,
         chosen_receiver_id=raw.chosen_receiver_id,
         chosen_pass_risk=raw.chosen_pass_risk,
         explain=raw.explain,
@@ -688,6 +742,14 @@ def _load_calculator() -> None:
             pitch_length=PITCH_LENGTH,
             pitch_width=PITCH_WIDTH,
         )
+        # Tactical-board + replay API calls do not load full match metadata (`match_meta`).
+        # EPVCalculator uses `match_meta.home_sides` to decide which goal a team attacks.
+        # Without it, `_resolve_goal_x` defaults to attacking the +X goal for *both* teams,
+        # which makes away-team shot/dribble/pass values unrealistic.
+        #
+        # For website usage we treat the abstract "home" side as left→right in period 1,
+        # and away as the opposite. (Replay routes also use this 1/2 team_id convention.)
+        _calculator.match_meta = {"home_id": 1, "away_id": 2, "home_sides": ["left_to_right"]}
     except Exception as e:
         _calculator_error = f"EPVCalculator initialization failed: {e}"
         return
@@ -721,6 +783,23 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/api/health/db")
+def health_db(db: Session = Depends(get_db)) -> dict:
+    """Verify PostgreSQL (e.g. AWS RDS) is reachable using the same pool as all API routes.
+
+    Use after deploy to confirm `DATABASE_URL` / `PG*` env vars point at the intended database.
+    Does not cache query results; each call issues `SELECT 1`.
+    """
+    try:
+        db.execute(text("SELECT 1"))
+        return {"status": "ok", "database": "connected"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "error", "database": "disconnected", "message": str(e)},
+        )
+
+
 @app.post("/api/epv", response_model=EPVResponse)
 def epv(payload: EPVRequest) -> EPVResponse:
     if _calculator_error:
@@ -740,8 +819,14 @@ def epv(payload: EPVRequest) -> EPVResponse:
             },
         )
     try:
-        raw = compute_epv_with_calculator(payload, _calculator)
-        return apply_profile_to_response(raw, payload)
+        # Final recommendation selection:
+        # `EPVCalculator.get_best_action()` already applies the full contextual policy
+        # (pressure/blocked-shot penalties, safe-pass override, dribble-open-space context)
+        # and returns a single coherent (best_action, epv, q_*) bundle.
+        #
+        # Avoid any extra post-hoc "take argmax(q_*)" logic here, because it can
+        # re-introduce unrealistic shoot recommendations by ignoring those policy rules.
+        return compute_epv_with_calculator(payload, _calculator)
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -750,3 +835,675 @@ def epv(payload: EPVRequest) -> EPVResponse:
                 "message": str(e),
             },
         )
+
+
+# =========================
+# Replay recommendation (arrow only; no resimulation)
+# =========================
+
+
+class ReplayRecommendRequest(BaseModel):
+    match_id: str
+    moment_id: str
+    center_frame: int
+    event_type: Optional[str] = None
+    team_side: Optional[Literal["home", "away"]] = None
+    player_id: Optional[int] = None
+
+
+class CounterfactualOverlay(BaseModel):
+    kind: Literal["lane"]
+    from_: dict = Field(..., alias="from")
+    to: dict
+
+
+class ReplayRecommendResponse(BaseModel):
+    """Response consumed by the Replay page.
+
+    How arrow data is returned:
+    - `overlay` contains a single lane arrow in center coords for the frontend to draw.
+    - `recommendation.target_point` is also provided as a direct fallback.
+    """
+
+    recommendation: dict
+    overlay: Optional[dict] = None
+    epv: dict
+    decision_frame: Optional[int] = None
+    teammate_overlays: Optional[list[dict]] = None
+    chosen_target_player_id: Optional[int] = None
+    fallback_reason: Optional[str] = None
+
+
+@app.post("/replay/recommend", response_model=ReplayRecommendResponse)
+def replay_recommend(payload: ReplayRecommendRequest, db: Session = Depends(get_db)) -> ReplayRecommendResponse:
+    """Return a recommended action arrow for a real replay moment.
+
+    Requirements:
+    - Uses AWS-backed tracking/event data (no local files)
+    - No resimulation: this returns only an arrow + EPV numbers for the UI
+
+    Data flow (high level):
+    1) Read one `frame` worth of `detection` rows from RDS for `(match_id, center_frame)`.
+    2) Infer who has the ball (heuristic over detections; caller may override via `player_id`).
+    3) Convert that snapshot into an `EPVRequest` and run the existing `EPVCalculator` pipeline.
+    4) Map the model's `best_action` into a UI arrow:
+       - The arrow starts at the possessor's tracked `(x,y)` in **center** coordinates.
+       - The arrow ends at `best_action_target` converted back to center coords when present.
+       - If the model does not emit a target point, aim at the defending goal center (shot-like default).
+
+    The frontend should treat `overlay` as the authoritative geometry for drawing pass/dribble/shot lanes.
+    """
+    if _calculator_error or _calculator is None:
+        raise HTTPException(status_code=503, detail={"error": "EPVCalculator unavailable", "message": _calculator_error or "not loaded"})
+
+    match_id = int(payload.match_id)
+    center_frame = int(payload.center_frame)
+
+    # Pull a single frame snapshot from RDS (filtered in SQL by match_id + frame_id).
+    frame = replay_service.fetch_single_center_frame(db, match_id=match_id, frame_id=center_frame)
+    if frame is None:
+        raise HTTPException(status_code=404, detail={"error": "Frame not found", "message": f"No tracking for match {match_id} frame {center_frame}"})
+
+    poss = replay_service.derive_possessor(frame) or {}
+    poss_player_id = payload.player_id or poss.get("player_id")
+    if poss_player_id is None:
+        raise HTTPException(status_code=422, detail={"error": "No possessor", "message": "Could not infer possessor from tracking frame; provide player_id"})
+
+    teams = replay_service.get_match_teams(db, match_id)
+    poss_team_id = poss.get("team_id")
+    poss_side: Literal["home","away"] = "home"
+    if payload.team_side in ("home", "away"):
+        poss_side = payload.team_side
+    elif poss_team_id is not None and teams.away_team_id is not None and poss_team_id == teams.away_team_id:
+        poss_side = "away"
+
+    # Build EPVRequest from the tracking snapshot.
+    # Tracking frame uses center coords: x∈[-52.5,52.5], y∈[-34,34].
+    players: list[PlayerIn] = []
+    for p in frame.get("player_data") or []:
+        pid = p.get("player_id")
+        if pid is None:
+            continue
+        # Convert center coords -> API coords expected by EPVRequest (0..105, 0..68).
+        x_api, y_api = _center_to_api_coords(float(p["x"]), float(p["y"]))
+        side = "home"
+        tid = p.get("team_id")
+        if tid is not None and teams.away_team_id is not None and int(tid) == int(teams.away_team_id):
+            side = "away"
+        pro = _profile_by_id(str(int(pid)))
+        sm = None
+        if pro is not None:
+            sm = SkillMultipliers(
+                finishing=float(pro.get("finishing", 0.5)),
+                passing=float(pro.get("passing", 0.5)),
+                dribbling=float(pro.get("dribbling", 0.5)),
+            )
+        # Orientation (`theta`) is not available in the tracking snapshot we fetch here.
+        # We inject a consistent default so dribble context is direction-correct:
+        # - home attacks toward +X => theta=0
+        # - away attacks toward -X => theta=pi
+        theta = 0.0 if side == "home" else math.pi
+        players.append(
+            PlayerIn(
+                id=f"{side}-{int(pid)}",
+                team=side,  # type: ignore[arg-type]
+                x=float(x_api),
+                y=float(y_api),
+                theta=float(theta),
+                hasBall=(int(pid) == int(poss_player_id) and side == poss_side),
+                profile_id=str(int(pid)),
+                skill_multipliers=sm,
+            )
+        )
+
+    owner_id = f"{poss_side}-{int(poss_player_id)}"
+    epv_req = EPVRequest(
+        frame=center_frame,
+        possessionTeam=poss_side,
+        ballOwnerId=owner_id,
+        players=players,
+        ballOwnerProfile="average",
+    )
+    # Use the calculator's recommendation directly (no post-hoc re-ranking).
+    res = compute_epv_with_calculator(epv_req, _calculator)
+
+    # Determine target point in center coords for the arrow.
+    if res.best_action_target is not None:
+        tx_center, ty_center = _api_to_center_coords(float(res.best_action_target.x), float(res.best_action_target.y))
+    else:
+        # Default shot target: goal center in center coords.
+        tx_center, ty_center = (52.5, 0.0) if poss_side == "home" else (-52.5, 0.0)
+
+    # From point: possessor location from tracking frame (center coords).
+    poss_row = next(
+        (pp for pp in (frame.get("player_data") or []) if int(pp.get("player_id") or -1) == int(poss_player_id)),
+        None,
+    )
+    if not poss_row:
+        raise HTTPException(status_code=422, detail={"error": "Possessor missing", "message": "Possessor not present in tracking detections for this frame"})
+    fx, fy = float(poss_row["x"]), float(poss_row["y"])
+
+    overlay = {
+        "kind": "lane",
+        "from": {"x": fx, "y": fy},
+        "to": {"x": float(tx_center), "y": float(ty_center)},
+    }
+
+    action = res.best_action
+    summary = f"Recommended: {action}"
+
+    return ReplayRecommendResponse(
+        recommendation={
+            "text": summary,
+            "action": action,
+            "target_point": {"x": float(tx_center), "y": float(ty_center)},
+            "summary": summary,
+            "target_player_id": None,
+            "epv_delta_est": None,
+        },
+        overlay=overlay,
+        epv={
+            "epv_original": float(res.epv),
+            "epv_recommended": float(res.epv),
+            "epv_delta": 0.0,
+        },
+        decision_frame=center_frame,
+        teammate_overlays=None,
+        chosen_target_player_id=None,
+        fallback_reason=None,
+    )
+
+
+# =========================
+# Tactical Board (backend-driven)
+# =========================
+#
+# Frontend responsibilities:
+# - Rendering + dragging interactions
+# - Formation presets (layout only)
+#
+# Backend responsibilities (this section):
+# - Query MLS 2023 teams/players from AWS RDS (`teams`, `players`)
+# - Model inference via EPVCalculator (local .pkl models)
+# - Player individuality via skill registry (local skill CSVs)
+# - Season heatmaps via AWS tables (`shots`, `passes`, `carries`)
+
+
+class TacticsTeam(BaseModel):
+    team_id: int
+    team_name: Optional[str] = None
+
+
+class TacticsPlayer(BaseModel):
+    player_id: int
+    name: str
+    position: Optional[str] = None
+    team_id: Optional[int] = None
+    team_name: Optional[str] = None
+    # Individuality from local skill registry (normalized to [0,1]).
+    pass_skill: float = 0.5
+    dribble_skill: float = 0.5
+    shot_skill: float = 0.5
+
+
+class TacticsRosterPlayer(BaseModel):
+    """Legacy shape used by the current UI.
+
+    NOTE: `team` is a string; we populate it with the team name.
+    """
+
+    player_id: int
+    name: str
+    team: str
+    team_name: str
+    position: str
+    pass_skill: float
+    dribble_skill: float
+    shot_skill: float
+
+
+class TacticsPlayerIn(BaseModel):
+    player_id: str
+    x: float  # center coords (world): [-52.5, 52.5]
+    y: float  # center coords (world): [-34, 34]
+    pos: Optional[str] = None
+
+
+class TacticsBallCarrierIn(BaseModel):
+    player_id: str
+    x: float
+    y: float
+    team: Literal["home", "away"]
+
+
+class TacticsRecommendationRequest(BaseModel):
+    ball_carrier: TacticsBallCarrierIn
+    home: List[TacticsPlayerIn]
+    away: List[TacticsPlayerIn]
+
+
+class TacticsTarget(BaseModel):
+    type: Literal["player", "point", "goal"]
+    x: float
+    y: float
+    player_id: Optional[str] = None
+
+
+class TacticsExplain(BaseModel):
+    pass_risk: float
+    nearest_defender_dist: float
+
+
+class TacticsRecommendationResponse(BaseModel):
+    epv: float
+    best_action: Literal["pass", "dribble", "shoot"]
+    q_pass: float
+    q_dribble: float
+    q_shoot: float
+    target: TacticsTarget
+    explain: TacticsExplain
+
+
+class HeatmapCell(BaseModel):
+    col: int
+    row: int
+    intensity: float
+
+
+class PlayerHeatmapResponse(BaseModel):
+    player_id: int
+    player_name: str
+    kind: Literal["shots", "passes", "carries", "goals"]
+    cols: int
+    rows: int
+    cells: List[HeatmapCell]
+    note: str
+
+
+def _center_to_api(x_center: float, y_center: float) -> tuple[float, float]:
+    """Convert center coords (-52.5..52.5, -34..34) to API coords (0..105, 0..68)."""
+    return (x_center + GOAL_X_CENTER, y_center + PITCH_WIDTH / 2)
+
+
+def _api_to_center(x_api: float, y_api: float) -> tuple[float, float]:
+    """Convert API coords (0..105, 0..68) to center coords (-52.5..52.5, -34..34)."""
+    return (x_api - GOAL_X_CENTER, y_api - PITCH_WIDTH / 2)
+
+
+def _skill_profile_for_player_id(player_id: int) -> Optional[dict]:
+    # Player individuality is keyed by profile_id == player_id.
+    return _profile_by_id(str(player_id))
+
+
+def _resolve_player_name_from_db(db: Session, player_id: int) -> str:
+    players = _table(db, "players")
+    pid = _first_col(players, "id")
+    pname = _first_col(players, "full_name", "name")
+    if pid is None or pname is None:
+        return f"Player {player_id}"
+    row = db.execute(select(pname).where(pid == int(player_id))).first()
+    if row and row[0]:
+        return str(row[0]).strip()
+    pro = _skill_profile_for_player_id(int(player_id))
+    return (pro.get("label") if pro else None) or f"Player {player_id}"
+
+
+@app.get("/api/tactics/teams", response_model=List[TacticsTeam])
+def tactics_teams(db: Session = Depends(get_db)) -> List[TacticsTeam]:
+    """MLS teams for Tactical Board dropdowns.
+
+    AWS table: `teams`
+    """
+    teams = _table(db, "teams")
+    tid = _first_col(teams, "id")
+    tname = _first_col(teams, "name")
+    if tid is None:
+        raise HTTPException(status_code=500, detail={"error": "teams table missing id"})
+    rows = db.execute(select(tid, tname).order_by(tname if tname is not None else tid)).all()
+    return [
+        TacticsTeam(team_id=int(r[0]), team_name=str(r[1]).strip() if len(r) > 1 and r[1] is not None else None)
+        for r in rows
+        if r and r[0] is not None
+    ]
+
+
+@app.get("/api/tactics/players", response_model=List[TacticsPlayer])
+def tactics_players(team_id: int = Query(..., ge=1), db: Session = Depends(get_db)) -> List[TacticsPlayer]:
+    """Players by team (backend-driven).
+
+    AWS tables: `players`, `teams`
+    Individuality: merged from local skill CSV registry.
+    """
+    players = _table(db, "players")
+    teams = _table(db, "teams")
+
+    pid = _first_col(players, "id")
+    pname = _first_col(players, "full_name", "name")
+    ppos = _first_col(players, "position")
+    pteam = _first_col(players, "team_id")
+    tid = _first_col(teams, "id")
+    tname = _first_col(teams, "name")
+    if pid is None or pname is None or pteam is None:
+        raise HTTPException(status_code=500, detail={"error": "players table missing required columns"})
+
+    stmt = (
+        select(
+            pid.label("player_id"),
+            pname.label("name"),
+            ppos.label("position") if ppos is not None else None,
+            pteam.label("team_id"),
+            tname.label("team_name") if tname is not None else None,
+        )
+        .select_from(players.outerjoin(teams, tid == pteam if tid is not None else True))
+        .where(pteam == int(team_id))
+        .order_by(pname)
+    )
+    rows = db.execute(stmt).mappings().all()
+    out: List[TacticsPlayer] = []
+    for r in rows:
+        p_id = int(r["player_id"])
+        pro = _skill_profile_for_player_id(p_id)
+        out.append(
+            TacticsPlayer(
+                player_id=p_id,
+                name=str(r["name"]).strip(),
+                position=str(r.get("position")).strip() if r.get("position") is not None else None,
+                team_id=int(r.get("team_id")) if r.get("team_id") is not None else None,
+                team_name=str(r.get("team_name")).strip() if r.get("team_name") is not None else None,
+                pass_skill=float(pro.get("passing", 0.5)) if pro else 0.5,
+                dribble_skill=float(pro.get("dribbling", 0.5)) if pro else 0.5,
+                shot_skill=float(pro.get("finishing", 0.5)) if pro else 0.5,
+            )
+        )
+    return out
+
+
+@app.get("/api/tactics/roster", response_model=List[TacticsRosterPlayer])
+def tactics_roster(db: Session = Depends(get_db)) -> List[TacticsRosterPlayer]:
+    """Legacy roster list used by the current UI.
+
+    AWS tables: `players`, `teams`
+    Individuality: merged from local skill CSV registry.
+    """
+    players = _table(db, "players")
+    teams = _table(db, "teams")
+
+    pid = _first_col(players, "id")
+    pname = _first_col(players, "full_name", "name")
+    ppos = _first_col(players, "position")
+    pteam = _first_col(players, "team_id")
+    tid = _first_col(teams, "id")
+    tname = _first_col(teams, "name")
+    if pid is None or pname is None:
+        raise HTTPException(status_code=500, detail={"error": "players table missing required columns"})
+
+    stmt = (
+        select(
+            pid.label("player_id"),
+            pname.label("name"),
+            ppos.label("position") if ppos is not None else None,
+            pteam.label("team_id") if pteam is not None else None,
+            tname.label("team_name") if tname is not None else None,
+        )
+        .select_from(players.outerjoin(teams, tid == pteam if tid is not None and pteam is not None else True))
+        .order_by(tname if tname is not None else pid, pname)
+    )
+    rows = db.execute(stmt).mappings().all()
+    out: List[TacticsRosterPlayer] = []
+    for r in rows:
+        p_id = int(r["player_id"])
+        team_name = str(r.get("team_name") or "Team").strip()
+        pro = _skill_profile_for_player_id(p_id)
+        out.append(
+            TacticsRosterPlayer(
+                player_id=p_id,
+                name=str(r["name"]).strip(),
+                team=team_name,
+                team_name=team_name,
+                position=str(r.get("position") or "").strip(),
+                pass_skill=float(pro.get("passing", 0.5)) if pro else 0.5,
+                dribble_skill=float(pro.get("dribbling", 0.5)) if pro else 0.5,
+                shot_skill=float(pro.get("finishing", 0.5)) if pro else 0.5,
+            )
+        )
+    return out
+
+
+@app.post("/api/tactics/recommendation", response_model=TacticsRecommendationResponse)
+def tactics_recommendation(payload: TacticsRecommendationRequest) -> TacticsRecommendationResponse:
+    """EPV-driven recommendation for Tactical Board state.
+
+    Player individuality incorporation:
+    - Each selected MLS player is assigned `profile_id == player_id`
+    - Skill multipliers are pulled from the local skill CSV registry and injected into the model inputs
+    """
+    if _calculator_error or _calculator is None:
+        raise HTTPException(status_code=503, detail={"error": "EPVCalculator unavailable", "message": _calculator_error or "not loaded"})
+
+    bc = payload.ball_carrier
+    players: List[PlayerIn] = []
+
+    def add_player(side: Literal["home", "away"], p: TacticsPlayerIn) -> None:
+        ax, ay = _center_to_api(p.x, p.y)
+        pid_raw = str(p.player_id)
+        pid_int = int(pid_raw) if pid_raw.isdigit() else None
+        pro = _skill_profile_for_player_id(pid_int) if pid_int is not None else None
+        sm = None
+        if pro is not None:
+            sm = SkillMultipliers(
+                finishing=float(pro.get("finishing", 0.5)),
+                passing=float(pro.get("passing", 0.5)),
+                dribbling=float(pro.get("dribbling", 0.5)),
+            )
+        # Tactical board state does not include per-player facing direction.
+        # We set a deterministic default aligned with the board convention:
+        # - home attacks to +X => theta=0
+        # - away attacks to -X => theta=pi
+        theta = 0.0 if side == "home" else math.pi
+        players.append(
+            PlayerIn(
+                id=f"{side}-{pid_raw}",
+                team=side,
+                x=float(ax),
+                y=float(ay),
+                theta=float(theta),
+                hasBall=(pid_raw == str(bc.player_id) and side == bc.team),
+                profile_id=pid_raw,
+                skill_multipliers=sm,
+            )
+        )
+
+    for p in payload.home:
+        add_player("home", p)
+    for p in payload.away:
+        add_player("away", p)
+
+    epv_req = EPVRequest(
+        frame=0,
+        possessionTeam=bc.team,
+        ballOwnerId=f"{bc.team}-{bc.player_id}",
+        players=players,
+        ballOwnerProfile="average",
+    )
+    # Use the calculator's recommendation directly (no post-hoc re-ranking).
+    res = compute_epv_with_calculator(epv_req, _calculator)
+
+    # Backend → frontend target: center coords for arrow drawing.
+    if res.best_action == "shoot":
+        tx, ty = (52.5, 0.0) if bc.team == "home" else (-52.5, 0.0)
+        target = TacticsTarget(type="goal", x=tx, y=ty, player_id=None)
+    elif res.best_action_target is not None:
+        tx, ty = _api_to_center(float(res.best_action_target.x), float(res.best_action_target.y))
+        target = TacticsTarget(type="point", x=float(tx), y=float(ty), player_id=res.chosen_receiver_id)
+    else:
+        target = TacticsTarget(type="point", x=float(bc.x), y=float(bc.y), player_id=None)
+
+    # Defender-distance shown in the UI should reflect the *board state* directly.
+    # Compute nearest opponent to the ball carrier in center coords using the same
+    # players the model sees (no placeholders).
+    nearest_def = 100.0
+    try:
+        opp = payload.away if bc.team == "home" else payload.home
+        nearest_def = min(
+            (math.hypot(float(p.x) - float(bc.x), float(p.y) - float(bc.y)) for p in opp),
+            default=100.0,
+        )
+    except Exception:
+        nearest_def = 100.0
+
+    pass_risk = 0.0
+    try:
+        if res.explain and res.explain.pass_:
+            pass_risk = float(res.explain.pass_.best_pass_risk)
+    except Exception:
+        pass
+
+    return TacticsRecommendationResponse(
+        epv=float(res.epv),
+        best_action=res.best_action,
+        q_pass=float(res.q_pass),
+        q_dribble=float(res.q_dribble),
+        q_shoot=float(res.q_shoot),
+        target=target,
+        explain=TacticsExplain(pass_risk=float(pass_risk), nearest_defender_dist=float(nearest_def)),
+    )
+
+
+@app.get("/api/tactics/player-action-heatmap", response_model=PlayerHeatmapResponse)
+def player_action_heatmap(
+    player_id: int = Query(..., ge=1),
+    kind: Literal["shots", "passes", "carries", "goals"] = Query(...),
+    team_side: Optional[Literal["home", "away"]] = Query(
+        None,
+        description="Optional: orient distribution to match board attacking direction (home→right, away→left).",
+    ),
+    cols: int = Query(12, ge=4, le=40),
+    rows: int = Query(8, ge=4, le=30),
+    db: Session = Depends(get_db),
+) -> PlayerHeatmapResponse:
+    """Season action heatmaps for a selected player (MLS 2023).
+
+    AWS tables (filled by `fillTables.py` event split):
+    - `shots`, `passes`, `carries`, `goals` — each queried with **WHERE player_id = :id** only
+      (no full-table load into Python).
+    """
+    # DB-backed season event data (AWS RDS):
+    # - shots/goals come from the `shots` / `goals` tables (event start locations)
+    # - passes come from the `passes` table (pass start locations)
+    # - carries come from the `carries` table (carry start locations)
+    #
+    # This endpoint bins those real event locations into a coarse grid that the
+    # frontend renders as a polished "soccer-style" heatmap.
+    table_name = {"shots": "shots", "passes": "passes", "carries": "carries", "goals": "goals"}[kind]
+    t = _table(db, table_name)
+    pid = _first_col(t, "player_id")
+    xs = _first_col(t, "x_start", "x")
+    ys = _first_col(t, "y_start", "y")
+    if pid is None or xs is None or ys is None:
+        raise HTTPException(status_code=500, detail={"error": f"{table_name} missing required columns"})
+
+    # Pitch bounds in center coords (same coordinate space as the TacticalBoard UI).
+    x_min, x_max = -52.5, 52.5
+    y_min, y_max = -34.0, 34.0
+    dx = (x_max - x_min) / cols
+    dy = (y_max - y_min) / rows
+
+    counts = [[0 for _ in range(cols)] for _ in range(rows)]
+    stmt = select(xs, ys).where(pid == int(player_id))
+
+    # Coordinate normalization (source of truth: `EPV_SARG/AWS/goal_heatmap.py` and `carries_heat_map.py`):
+    # The DB tables may store any of these conventions depending on ingestion/export:
+    # - centered meters: x∈[-52.5,52.5], y∈[-34,34]
+    # - pitch coords:    x∈[0,105],     y∈[0,68]
+    # - percent coords:  x∈[0,100],     y∈[0,100]
+    # - unit coords:     x∈[0,1],       y∈[0,1]
+    #
+    # We detect the convention from the player's data range, then map into centered meters.
+    pts: list[tuple[float, float]] = []
+    x_vals: list[float] = []
+    y_vals: list[float] = []
+    for x_raw, y_raw in db.execute(stmt):
+        if x_raw is None or y_raw is None:
+            continue
+        try:
+            xf = float(x_raw)
+            yf = float(y_raw)
+        except Exception:
+            continue
+        pts.append((xf, yf))
+        x_vals.append(xf)
+        y_vals.append(yf)
+
+    if not pts:
+        name = _resolve_player_name_from_db(db, int(player_id))
+        return PlayerHeatmapResponse(
+            player_id=int(player_id),
+            player_name=name,
+            kind=kind,
+            cols=cols,
+            rows=rows,
+            cells=[],
+            note=f"No {kind} locations found for player {player_id}.",
+        )
+
+    x_lo, x_hi = min(x_vals), max(x_vals)
+    y_lo, y_hi = min(y_vals), max(y_vals)
+
+    def to_center(x: float, y: float) -> tuple[float, float]:
+        # Already centered meters
+        if x_lo >= -53 and x_hi <= 53 and y_lo >= -35 and y_hi <= 35:
+            return (x, y)
+        # 0..105 / 0..68 pitch coords
+        if x_lo >= 0 and x_hi <= 105.5 and y_lo >= 0 and y_hi <= 68.5:
+            return (x - 52.5, y - 34.0)
+        # 0..100 percentages
+        if x_lo >= 0 and x_hi <= 100.5 and y_lo >= 0 and y_hi <= 100.5:
+            return ((x / 100.0) * 105.0 - 52.5, (y / 100.0) * 68.0 - 34.0)
+        # 0..1 unit square
+        if x_lo >= 0 and x_hi <= 1.01 and y_lo >= 0 and y_hi <= 1.01:
+            return (x * 105.0 - 52.5, y * 68.0 - 34.0)
+        # Unknown; best-effort assume already centered.
+        return (x, y)
+
+    for x_raw, y_raw in pts:
+        cx, cy = to_center(x_raw, y_raw)
+        # Attacking-direction orientation:
+        # - Board convention: home attacks to +X, away attacks to -X.
+        # - If caller provides team_side="away", mirror X so the distribution appears on the
+        #   same attacking half the away team uses in the board view.
+        if team_side == "away":
+            cx = -cx
+        if cx < x_min or cx > x_max or cy < y_min or cy > y_max:
+            continue
+        col = int((cx - x_min) / dx)
+        row = int((cy - y_min) / dy)
+        col = max(0, min(cols - 1, col))
+        row = max(0, min(rows - 1, row))
+        counts[row][col] += 1
+
+    # Normalization (matches the reference AWS scripts under `EPV_SARG/AWS/*heatmap*.py`):
+    # - Create a 2D histogram of counts
+    # - Set `vmax` lower than the raw max so hotspots saturate faster (more contrast)
+    #   (AWS reference uses `vmax = max(heat) * 0.4`)
+    # - Convert each cell to intensity ∈ [0,1] by `min(count / vmax, 1)`
+    max_c = max((c for rr in counts for c in rr), default=0) or 1
+    vmax = max(1.0, float(max_c) * 0.4)
+    cells: List[HeatmapCell] = []
+    for r in range(rows):
+        for c in range(cols):
+            v = counts[r][c]
+            if v <= 0:
+                continue
+            intensity = min(1.0, float(v) / vmax)
+            cells.append(HeatmapCell(col=c, row=r, intensity=float(intensity)))
+
+    name = _resolve_player_name_from_db(db, int(player_id))
+    return PlayerHeatmapResponse(
+        player_id=int(player_id),
+        player_name=name,
+        kind=kind,
+        cols=cols,
+        rows=rows,
+        cells=cells,
+        note=f"{kind} locations aggregated across all games for player {player_id}.",
+    )

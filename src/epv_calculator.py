@@ -675,10 +675,17 @@ class EPVCalculator:
         Returns:
             Q-value for this pass
         """
-        # Calculate pass features
+        # Calculate pass features (all in center coordinates).
+        #
+        # IMPORTANT: "forward progress" must be measured relative to the *attacking goal*.
+        # The rest of the system supports both directions via `_resolve_goal_x`, but this
+        # feature was previously hard-coded as (x_dest - x_origin), which implicitly
+        # assumes attacking to +X. That makes away-team recommendations look incorrect
+        # (away attacks toward -X in period 1 in our web usage).
         pass_distance = np.sqrt((x_dest - x_origin)**2 + (y_dest - y_origin)**2)
         pass_angle = np.degrees(np.arctan2(y_dest - y_origin, x_dest - x_origin))
-        forward_progress = x_dest - x_origin
+        goal_x = self._resolve_goal_x(team_id, frame_data)
+        forward_progress = (x_dest - x_origin) if goal_x >= 0 else (x_origin - x_dest)
 
         # Pitch control at origin and destination
         pc_origin = 0.5
@@ -721,7 +728,9 @@ class EPVCalculator:
 
         # Other features
         speed_avg = 8.0  # Default pass speed
-        inside_defensive_shape = int(x_origin < last_defensive_line_x)
+        # Treat "inside_defensive_shape" as being behind the opponent line relative
+        # to the attacking direction (not absolute X).
+        inside_defensive_shape = int(x_origin < last_defensive_line_x) if goal_x >= 0 else int(x_origin > last_defensive_line_x)
 
         # Create feature dict
         feature_dict = {
@@ -812,7 +821,7 @@ class EPVCalculator:
         dribble_pressure_multiplier = float(np.clip(m, 0.1, 1.5))
 
         best_q = 0.0
-        destinations = self._sample_dribble_destinations(x, y)
+        destinations = self._sample_dribble_destinations(x, y, team_id=team_id, frame_data=frame_data)
         for dest_x, dest_y in destinations:
             if not self._is_valid_location(dest_x, dest_y):
                 continue
@@ -956,15 +965,31 @@ class EPVCalculator:
         destinations = sorted(destinations, key=lambda p: -p[0])  # Sort by x (forward)
         return destinations[:n]
 
-    def _sample_dribble_destinations(self, x: float, y: float, n: int = 4) -> List[Tuple[float, float]]:
-        """Sample reasonable dribble destinations."""
+    def _sample_dribble_destinations(
+        self,
+        x: float,
+        y: float,
+        team_id: Optional[int] = None,
+        frame_data: Optional[Dict] = None,
+        n: int = 4,
+    ) -> List[Tuple[float, float]]:
+        """Sample reasonable dribble destinations.
+
+        NOTE: These are *candidate* end points for the EPV recursion when evaluating
+        dribbles. They must align with the attacking direction; otherwise away-team
+        "dribble forward" options get sampled in the wrong direction and look wonky.
+        """
         destinations = []
 
-        # Forward dribbles
+        # Forward dribbles (relative to the attacking goal for this team + period).
+        gx = self.goal_x
+        if team_id is not None:
+            gx = self._resolve_goal_x(int(team_id), frame_data or {})
+        direction = 1.0 if gx >= 0 else -1.0
         for dist in [3, 5]:
-            destinations.append((x + dist, y))
-            destinations.append((x + dist, y + 2))
-            destinations.append((x + dist, y - 2))
+            destinations.append((x + direction * dist, y))
+            destinations.append((x + direction * dist, y + 2))
+            destinations.append((x + direction * dist, y - 2))
 
         return destinations[:n]
 
@@ -1536,12 +1561,19 @@ class EPVCalculator:
         elif best_action == "pass":
             best_action_target = chosen_pass_target if chosen_pass_target is not None else (x, y)
         elif best_action == "dribble":
+            # Dribble direction uses `theta` (radians). For the tactical board and replay
+            # endpoints we don't have player orientation, so the API server injects a
+            # consistent default: home faces +X (theta=0), away faces -X (theta=pi).
+            #
+            # As a safety net, if theta is missing here we align it with the attacking goal.
             theta = 0.0
             if frame_data and "player_data" in frame_data:
                 for p in frame_data["player_data"]:
                     if p.get("player_id") == player_id:
                         theta = float(p.get("theta", 0.0))
                         break
+            if theta == 0.0 and goal_x < 0:
+                theta = float(np.pi)
             open_m = dribble_open if dribble_open is not None else 0.0
             d = min(10.0, open_m) if open_m > 0 else 3.0
             tx = x + d * np.cos(theta)

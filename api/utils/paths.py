@@ -1,4 +1,14 @@
-"""Path utilities for SkillCorner tracking and events files."""
+"""Path utilities for local SkillCorner tracking and events files (offline / dev only).
+
+**Website runtime:** FastAPI replay and tactics routes must **not** import this module.
+They read **`frame`**, **`detection`**, **`events`**, **`matches`**, etc. from PostgreSQL
+via `api.db` + `api.services.replay_service` (filtered SQL, no full-table loads).
+
+**When this is used:** training scripts, one-off ingestion, or local tools that still expect
+`*_tracking.jsonl` / `*_dynamic_events.csv` under **`EPV_DATA_DIR`**.
+
+If `EPV_DATA_DIR` is unset, helpers here return empty lists or raise only when called — not at import.
+"""
 
 import os
 from pathlib import Path
@@ -9,21 +19,19 @@ from dotenv import load_dotenv
 # Load environment variables if not already loaded
 load_dotenv()
 
-# Read EPV_DATA_DIR from environment (required)
+# Read EPV_DATA_DIR from environment (optional).
+# If unset, local file helpers will raise when called (not at import time).
 EPV_DATA_DIR = os.getenv("EPV_DATA_DIR")
-if not EPV_DATA_DIR:
-    raise RuntimeError(
-        "EPV_DATA_DIR environment variable must be set. "
-        "Please set it in your .env file or environment."
-    )
 
 # Define directory paths
-tracking_dir = Path(EPV_DATA_DIR) / "tracking"
-events_dir = Path(EPV_DATA_DIR) / "dynamic_events"
+tracking_dir = Path(EPV_DATA_DIR) / "tracking" if EPV_DATA_DIR else None
+events_dir = Path(EPV_DATA_DIR) / "dynamic_events" if EPV_DATA_DIR else None
 
 
 def validate_directories() -> None:
     """Validate that tracking_dir and events_dir exist. Raise RuntimeError if missing."""
+    if tracking_dir is None or events_dir is None:
+        raise RuntimeError("EPV_DATA_DIR is not set; local file paths are unavailable.")
     if not tracking_dir.exists():
         raise RuntimeError(
             f"Tracking directory does not exist: {tracking_dir}\n"
@@ -44,12 +52,12 @@ def validate_directories() -> None:
         )
 
 
-# Validate directories on import
-validate_directories()
+# Do not validate on import (deployed backend runs without EPV_DATA_DIR).
 
 
 def get_tracking_path(match_id: str) -> Path:
     """Get Path for tracking file: '{match_id}_tracking.jsonl' in tracking_dir."""
+    validate_directories()
     return tracking_dir / f"{match_id}_tracking.jsonl"
 
 
@@ -59,6 +67,7 @@ def get_events_path(match_id: str) -> Path:
     Checks for both '{match_id}_events.csv' and '{match_id}_dynamic_events.csv'.
     Raises RuntimeError if neither exists.
     """
+    validate_directories()
     # Try both naming patterns
     events_path = events_dir / f"{match_id}_events.csv"
     dynamic_events_path = events_dir / f"{match_id}_dynamic_events.csv"
@@ -82,7 +91,7 @@ def list_available_match_ids() -> List[str]:
     Returns a list of match_id strings (extracted from filenames).
     """
     match_ids = []
-    if not tracking_dir.exists():
+    if tracking_dir is None or not tracking_dir.exists():
         return match_ids
     
     for file_path in tracking_dir.glob("*_tracking.jsonl"):
