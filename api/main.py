@@ -874,6 +874,32 @@ class ReplayRecommendResponse(BaseModel):
     fallback_reason: Optional[str] = None
 
 
+def _classify_actual_action(event_type: Optional[str], event_subtype: Optional[str] = None) -> Literal["pass", "dribble", "shoot"]:
+    """Map the moment's `events.event_type` (and optional subtype) onto one of the three EPV actions.
+
+    Why: the recommendation panel needs to compare "what they actually did" vs the model's
+    best action. We don't have a single column that says exactly that, so we infer it from
+    `event_type` strings used by the SkillCorner CSV exports.
+    """
+    blob = " ".join([str(s or "").lower() for s in (event_type, event_subtype)])
+    if any(k in blob for k in ("shot", "goal", "miss", "save", "block")):
+        return "shoot"
+    if any(k in blob for k in ("dribble", "carry", "miscontrol", "take_on", "run_with_ball")):
+        return "dribble"
+    # Defaults to pass: includes "pass", "failed_pass", "interception"/"tackle"/"recovery"
+    # (these are opponent reactions to a pass) and any unclassified action. Pass is the
+    # right default in soccer because it's the most common possession-loss path.
+    return "pass"
+
+
+def _q_for_action(epv_response: EPVResponse, action: Literal["pass", "dribble", "shoot"]) -> float:
+    if action == "pass":
+        return float(epv_response.q_pass)
+    if action == "dribble":
+        return float(epv_response.q_dribble)
+    return float(epv_response.q_shoot)
+
+
 @app.post("/replay/recommend", response_model=ReplayRecommendResponse)
 def replay_recommend(payload: ReplayRecommendRequest, db: Session = Depends(get_db)) -> ReplayRecommendResponse:
     """Return a recommended action arrow for a real replay moment.
@@ -890,6 +916,8 @@ def replay_recommend(payload: ReplayRecommendRequest, db: Session = Depends(get_
        - The arrow starts at the possessor's tracked `(x,y)` in **center** coordinates.
        - The arrow ends at `best_action_target` converted back to center coords when present.
        - If the model does not emit a target point, aim at the defending goal center (shot-like default).
+    5) Compare against what the player actually did using the moment's `event_type` so the
+       UI can show "actual vs recommended" with both EPV values and a delta.
 
     The frontend should treat `overlay` as the authoritative geometry for drawing pass/dribble/shot lanes.
     """
@@ -990,7 +1018,51 @@ def replay_recommend(payload: ReplayRecommendRequest, db: Session = Depends(get_
     }
 
     action = res.best_action
-    summary = f"Recommended: {action}"
+
+    # Resolve target player id for a recommended pass.
+    # `EPVResponse.chosen_receiver_id` is the API string id (e.g. "home-1234").
+    # Strip the team prefix to get the integer player_id used in the tracking frame.
+    target_player_id_int: Optional[int] = None
+    if action == "pass" and res.chosen_receiver_id:
+        try:
+            target_player_id_int = int(str(res.chosen_receiver_id).rsplit("-", 1)[-1])
+        except Exception:
+            target_player_id_int = None
+
+    # Look up player names so the UI can say "Pass to Joaquín Pereyra" rather than "pass to id=12345".
+    roster = replay_service.get_match_player_index(db, match_id)
+    poss_name = (roster.get(int(poss_player_id)) or {}).get("name") if roster else None
+    target_name: Optional[str] = None
+    if target_player_id_int is not None and roster:
+        target_name = (roster.get(int(target_player_id_int)) or {}).get("name")
+
+    # "What they actually did" — derive from the moment's event_type so we can compare.
+    actual_action: Literal["pass", "dribble", "shoot"] = _classify_actual_action(payload.event_type)
+    epv_recommended = float(res.epv)
+    epv_actual = _q_for_action(res, actual_action)
+    epv_delta = epv_recommended - epv_actual
+
+    if poss_name:
+        actual_phrase = {
+            "pass": f"{poss_name} attempted a pass",
+            "dribble": f"{poss_name} tried to dribble",
+            "shoot": f"{poss_name} took a shot",
+        }[actual_action]
+    else:
+        actual_phrase = {
+            "pass": "Player attempted a pass",
+            "dribble": "Player tried to dribble",
+            "shoot": "Player took a shot",
+        }[actual_action]
+    if action == "pass" and target_name:
+        rec_phrase = f"recommended pass to {target_name}"
+    elif action == "shoot":
+        rec_phrase = "recommended shot"
+    elif action == "dribble":
+        rec_phrase = "recommended dribble into space"
+    else:
+        rec_phrase = f"recommended {action}"
+    summary = f"Instead of: {actual_phrase} — {rec_phrase} (ΔEPV {epv_delta:+.3f})"
 
     return ReplayRecommendResponse(
         recommendation={
@@ -998,18 +1070,30 @@ def replay_recommend(payload: ReplayRecommendRequest, db: Session = Depends(get_
             "action": action,
             "target_point": {"x": float(tx_center), "y": float(ty_center)},
             "summary": summary,
-            "target_player_id": None,
-            "epv_delta_est": None,
+            "target_player_id": target_player_id_int,
+            "target_player_name": target_name,
+            "actual_action": actual_action,
+            "actual_phrase": actual_phrase,
+            "recommended_phrase": rec_phrase,
+            "possessor_name": poss_name,
+            "epv_delta_est": epv_delta,
         },
         overlay=overlay,
         epv={
-            "epv_original": float(res.epv),
-            "epv_recommended": float(res.epv),
-            "epv_delta": 0.0,
+            # `epv_original` retained for backward-compat (= EPV of the action they took).
+            "epv_original": float(epv_actual),
+            "epv_actual": float(epv_actual),
+            "epv_recommended": float(epv_recommended),
+            "epv_delta": float(epv_delta),
+            "actual_action": actual_action,
+            "recommended_action": action,
+            "q_pass": float(res.q_pass),
+            "q_dribble": float(res.q_dribble),
+            "q_shoot": float(res.q_shoot),
         },
         decision_frame=center_frame,
         teammate_overlays=None,
-        chosen_target_player_id=None,
+        chosen_target_player_id=target_player_id_int,
         fallback_reason=None,
     )
 

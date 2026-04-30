@@ -127,6 +127,7 @@ class RenderPlayer(BaseModel):
     id: Optional[int]
     team_id: Optional[int]
     team_side: Optional[str] = None
+    name: Optional[str] = None
     x: float
     y: float
     speed: Optional[float] = None
@@ -139,6 +140,13 @@ class RenderFrame(BaseModel):
     ball: Optional[RenderBall] = None
     players: List[RenderPlayer]
     derived_possession: Optional[dict] = None
+    # Diagnostic fields populated by `build_tracking_render_window`:
+    # - `raw_player_count`: number of players the DB returned for this exact frame_id
+    #   (BEFORE any forward-fill from neighbouring frames).
+    # - `players_filled`: True when this frame's `players` were inherited from another
+    #   frame because the raw row set was sparse/empty.
+    raw_player_count: Optional[int] = None
+    players_filled: Optional[bool] = None
 
 
 class TrackingRenderWindow(BaseModel):
