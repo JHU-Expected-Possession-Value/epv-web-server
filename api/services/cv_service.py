@@ -143,3 +143,103 @@ def _heuristic_recommendation_from_single_image(out: dict[str, Any]) -> dict[str
             "player_detections": int(len(players)),
         },
     }
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
+from PIL import Image
+import numpy as np
+
+app = FastAPI()
+
+# Allow frontend to call backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def read_image(file: UploadFile):
+    img = Image.open(file.file).convert("RGB")
+    return np.array(img)
+
+@app.post("/analyze")
+async def analyze(
+    image: UploadFile = File(...),
+    roster: Optional[UploadFile] = File(None),
+):
+    image_np = read_image(image)
+    roster_bytes = await roster.read() if roster else None
+
+    result = analyze_image(
+        image_rgb=image_np,
+        roster_csv_bytes=roster_bytes,
+    )
+
+    return result
+
+
+@app.post("/homography")
+async def run_homography(
+    image: UploadFile = File(...),
+    feature_type: str = Form(...),
+    feature_points: str = Form(...),  # JSON string
+    roster: Optional[UploadFile] = File(None),
+):
+    image_np = read_image(image)
+    roster_bytes = await roster.read() if roster else None
+    points = json.loads(feature_points)
+
+    result = analyze_image(
+        image_rgb=image_np,
+        roster_csv_bytes=roster_bytes,
+        feature_type=feature_type,
+        feature_points=points,
+    )
+
+    return result
+
+@app.post("/compute-homography")
+async def compute_homography(
+    image: UploadFile = File(...),
+    feature_type: str = Form(...),
+    feature_points: str = Form(...),
+    ball_x: float = Form(...),
+    ball_y: float = Form(...),
+    roster: Optional[UploadFile] = File(None),
+):
+    image_np = read_image(image)
+
+    roster_bytes = await roster.read() if roster else None
+
+    points = json.loads(feature_points)
+
+    # Run full analysis with homography
+    result = analyze_image(
+        image_rgb=image_np,
+        roster_csv_bytes=roster_bytes,
+        feature_type=feature_type,
+        feature_points=points,
+    )
+
+    # Project manually selected ball
+    if result.get("homography"):
+        H = np.array(result["homography"]["H"], dtype=np.float32)
+
+        fx, fy = project_to_field(
+            H,
+            float(ball_x),
+            float(ball_y),
+        )
+
+        if result.get("ball") is None:
+            result["ball"] = {}
+
+        result["ball"]["x"] = ball_x
+        result["ball"]["y"] = ball_y
+        result["ball"]["field_x_m"] = fx
+        result["ball"]["field_y_m"] = fy
+
+    return result
