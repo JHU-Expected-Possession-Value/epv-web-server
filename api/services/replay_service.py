@@ -346,6 +346,79 @@ def get_match_player_index(db: Session, match_id: int) -> dict[int, dict]:
     return out
 
 
+def get_event_player_team_index(db: Session, match_id: int) -> dict[int, dict]:
+    """Backstop: harvest {player_id: {team_id, name}} from the `events` table.
+
+    Why this exists:
+      The `players` table is sometimes incomplete for a match — e.g. only a
+      starting XI was loaded, or `fillTables.py` skipped subs whose rows in
+      the SkillCorner roster JSON were missing a team_id. When this happens,
+      the tracking `detection` rows still reference a `player_id`, but the
+      roster lookup returns nothing and the renderer falls back to slate
+      (grey). The user reported exactly this symptom.
+
+      The `events` table is much denser per match: each row carries
+      `player_id` + `team_id` (and usually `player_name`), so it can be used
+      as a fallback team lookup for any player that touches the ball during
+      the match. We aggregate the most-common team_id seen per player to
+      defend against rare mis-tags.
+
+    This is intended to be merged INTO the result of `get_match_player_index`,
+    NOT replace it. The `players` table remains the source of truth when
+    available; this just fills the gaps.
+    """
+    try:
+        events_t = _table(db, "events")
+    except Exception:
+        return {}
+
+    e_match = _first_col(events_t, "match_id")
+    e_pid = _first_col(events_t, "player_id")
+    e_tid = _first_col(events_t, "team_id")
+    e_name = _first_col(events_t, "player_name", "player")
+    if e_match is None or e_pid is None or e_tid is None:
+        return {}
+
+    cols = [e_pid.label("player_id"), e_tid.label("team_id")]
+    if e_name is not None:
+        cols.append(e_name.label("player_name"))
+
+    try:
+        rows = db.execute(
+            select(*cols).where(e_match == int(match_id))
+        ).mappings().all()
+    except Exception:
+        return {}
+
+    # Aggregate: for each player, count team_id occurrences and pick the
+    # most frequent. (Defensive: handles stray rows tagged to the wrong team.)
+    counts: dict[int, dict[int, int]] = {}
+    names: dict[int, str] = {}
+    for r in rows:
+        pid = _safe_int(r.get("player_id"))
+        tid = _safe_int(r.get("team_id"))
+        if pid is None or tid is None:
+            continue
+        counts.setdefault(pid, {})
+        counts[pid][tid] = counts[pid].get(tid, 0) + 1
+        nm = r.get("player_name")
+        if nm and pid not in names:
+            s = str(nm).strip()
+            if s and s.lower() != "nan":
+                names[pid] = s
+
+    out: dict[int, dict] = {}
+    for pid, tcounts in counts.items():
+        # Most frequent team_id wins. Ties broken by smaller team_id (stable).
+        best_tid = max(tcounts.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+        out[pid] = {
+            "team_id": best_tid,
+            "name": names.get(pid),
+            "position": None,
+        }
+    return out
+
+
 def get_match_teams(db: Session, match_id: int) -> ReplayTeams:
     matches = _table(db, "matches")
     mid = _first_col(matches, "id", "match_id")
@@ -761,17 +834,118 @@ def fetch_tracking_window_raw(db: Session, match_id: int, start_frame: int, end_
 
 
 def to_center_coords(frames: Iterable[dict]) -> list[dict]:
-    """Normalize SkillCorner-style coords to renderer center coords.
+    """Normalize raw tracking coords to renderer center coords.
 
-    Assumption (SkillCorner):
-    - x is 0..105 -> convert to [-52.5..52.5] by subtracting 52.5
-    - y is already centered in [-34..34] (pass-through)
+    Renderer expects: x ∈ [-52.5, 52.5], y ∈ [-34, 34]   (FIFA 105 × 68 m).
+
+    The raw `detection` rows can come from either of two SkillCorner conventions
+    depending on how the upstream JSONL/CSV was loaded:
+
+      A) Pitch-origin format:  x ∈ [0, 105],   y ∈ [0, 68]   (or y ∈ [-34, 34])
+      B) Centered format:      x ∈ [-52.5, 52.5], y ∈ [-34, 34]
+
+    The previous implementation hard-coded "always subtract 52.5 from x and
+    pass y through". That assumes (A) for x and (B) for y. When the data is
+    actually (B) for x — which is the bug the user observed: every player
+    visibly shifted half a pitch to the left and clipped into the home goal
+    box — we end up with x' = x_raw − 52.5 ∈ [−105, 0], so the right half
+    of the pitch goes off-screen and the left half ends up on top of the goal.
+
+    Fix: sample the actual raw range across this window, then pick offsets
+    that map the data INTO renderer coords:
+
+      - If min_x is comfortably negative (≤ −1), assume (B) for x → no shift.
+      - Else assume (A) for x → subtract 52.5.
+      - Same idea for y with thresholds around 34.
+
+    This is local per-window (not cached globally) so a DB load that mixes
+    conventions across matches still renders correctly for each one.
     """
-    out = []
-    for f in frames:
+    frames_list = list(frames)
+
+    # ------------------------------------------------------------------
+    # Sample raw x/y across this window to detect the source range.
+    # ------------------------------------------------------------------
+    xs: list[float] = []
+    ys: list[float] = []
+    for f in frames_list:
         ball = f.get("ball_data")
-        if ball and ball.get("x") is not None:
-            ball = {**ball, "x": float(ball["x"]) - 52.5}
+        if ball:
+            bx, by = ball.get("x"), ball.get("y")
+            if bx is not None:
+                try:
+                    xs.append(float(bx))
+                except (TypeError, ValueError):
+                    pass
+            if by is not None:
+                try:
+                    ys.append(float(by))
+                except (TypeError, ValueError):
+                    pass
+        for p in f.get("player_data") or []:
+            px, py = p.get("x"), p.get("y")
+            if px is not None:
+                try:
+                    xs.append(float(px))
+                except (TypeError, ValueError):
+                    pass
+            if py is not None:
+                try:
+                    ys.append(float(py))
+                except (TypeError, ValueError):
+                    pass
+
+    # Decide x offset.
+    #
+    # Heuristic:
+    #   - If the smallest x we see is below -1, the raw data is already
+    #     centered around 0 (format B). No shift.
+    #   - Otherwise treat as format A and subtract 52.5.
+    #
+    # We use -1 (not 0) as the threshold so a tiny negative noise value
+    # doesn't accidentally flip the detection.
+    if xs:
+        x_min = min(xs)
+        x_max = max(xs)
+        if x_min < -1.0:
+            x_offset = 0.0  # already centered
+        else:
+            # Pitch-origin format. If max is well above 60, full 105 m pitch.
+            # If it's smaller (e.g. 100, 120), we still subtract half-pitch
+            # because that's the only reasonable hypothesis when min ≥ 0.
+            x_offset = 52.5
+        # Defensive: if values look totally out-of-range (e.g. millimetres or
+        # decimetres), fall back to centering on the observed midpoint so the
+        # visualization is at least usable. This shouldn't trigger in practice.
+        if x_max - x_min > 200 or x_max - x_min < 1:
+            x_offset = (x_max + x_min) / 2.0
+    else:
+        x_offset = 52.5  # legacy default
+
+    if ys:
+        y_min = min(ys)
+        y_max = max(ys)
+        if y_min < -1.0:
+            y_offset = 0.0  # already centered ([-34, 34])
+        else:
+            y_offset = 34.0  # pitch-origin ([0, 68])
+        if y_max - y_min > 150 or y_max - y_min < 1:
+            y_offset = (y_max + y_min) / 2.0
+    else:
+        y_offset = 0.0  # legacy default (pass-through)
+
+    # ------------------------------------------------------------------
+    # Apply the chosen offsets.
+    # ------------------------------------------------------------------
+    out = []
+    for f in frames_list:
+        ball = f.get("ball_data")
+        if ball and ball.get("x") is not None and ball.get("y") is not None:
+            ball = {
+                **ball,
+                "x": float(ball["x"]) - x_offset,
+                "y": float(ball["y"]) - y_offset,
+            }
         players = []
         for p in f.get("player_data") or []:
             if p.get("x") is None or p.get("y") is None:
@@ -780,8 +954,8 @@ def to_center_coords(frames: Iterable[dict]) -> list[dict]:
                 {
                     "player_id": _safe_int(p.get("player_id")),
                     "team_id": _safe_int(p.get("team_id")),
-                    "x": float(p["x"]) - 52.5,
-                    "y": float(p["y"]),
+                    "x": float(p["x"]) - x_offset,
+                    "y": float(p["y"]) - y_offset,
                 }
             )
         out.append({**f, "ball_data": ball, "player_data": players})
@@ -856,6 +1030,24 @@ def build_tracking_render_window(
     # without this lookup every player would render in 'unknown' (slate) and have
     # no name. We fetch once for the whole window.
     roster = get_match_player_index(db, match_id)
+    # Fallback roster harvested from the `events` table. The user reported that
+    # some players still rendered grey even after the players-table lookup was
+    # made robust — that means those player_ids genuinely aren't in `players`
+    # for this match. The `events` table almost always carries them, paired
+    # with team_id, so we use it as a backstop. The `players` table wins
+    # when a player exists in BOTH (so any per-match team correction sticks).
+    events_roster = get_event_player_team_index(db, match_id)
+    if events_roster:
+        for pid, entry in events_roster.items():
+            existing = roster.get(pid)
+            if existing is None:
+                roster[pid] = entry
+            else:
+                # Only fill missing fields — never overwrite players-table data.
+                if existing.get("team_id") is None and entry.get("team_id") is not None:
+                    existing["team_id"] = entry["team_id"]
+                if not existing.get("name") and entry.get("name"):
+                    existing["name"] = entry["name"]
 
     def _resolve_side(tid: Optional[int]) -> Optional[str]:
         if tid is None:
@@ -1017,6 +1209,18 @@ def fetch_single_center_frame(db: Session, match_id: int, frame_id: int) -> Opti
         return None
     f = centered[0]
     roster = get_match_player_index(db, match_id)
+    # Same events-table backstop as build_tracking_render_window.
+    events_roster = get_event_player_team_index(db, match_id)
+    if events_roster:
+        for pid, entry in events_roster.items():
+            existing = roster.get(pid)
+            if existing is None:
+                roster[pid] = entry
+            else:
+                if existing.get("team_id") is None and entry.get("team_id") is not None:
+                    existing["team_id"] = entry["team_id"]
+                if not existing.get("name") and entry.get("name"):
+                    existing["name"] = entry["name"]
     if roster:
         for p in f.get("player_data") or []:
             pid = _safe_int(p.get("player_id"))
